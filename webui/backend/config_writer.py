@@ -100,7 +100,8 @@ def _project_pay(answers: dict) -> dict:
             }
             # webshare 模式下 pipeline._ensure_gost_alive 会拉起本地 gost 中继；
             # card.py 直接连这个地址出网（避开 example 模板透传的 USER:PASS 占位）
-            out["proxy"] = f"socks5://127.0.0.1:{gost_port}"
+            # socks5h:// 让 DNS 在代理端解析，避免本地 DNS 解析失败
+            out["proxy"] = f"socks5h://127.0.0.1:{gost_port}"
         elif mode == "none":
             out["proxy"] = ""
         elif proxy.get("url"):
@@ -134,7 +135,7 @@ def _project_reg(answers: dict) -> dict:
         mode = proxy.get("mode")
         if mode == "webshare" and proxy.get("api_key"):
             gost_port = int(proxy.get("gost_listen_port", 18898))
-            out["proxy"] = f"socks5://127.0.0.1:{gost_port}"
+            out["proxy"] = f"socks5h://127.0.0.1:{gost_port}"
         elif mode == "none":
             out["proxy"] = ""
         elif proxy.get("url"):

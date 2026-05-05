@@ -1,4 +1,4 @@
-"""Local account inventory: list, validate, delete, push to CPA."""
+"""Local account inventory: list, validate, delete, push to CPA, retry payment."""
 from __future__ import annotations
 
 import json
@@ -13,6 +13,7 @@ from ..account_inventory import build_accounts_inventory
 from ..account_validator import validate_accounts
 from ..db import get_db
 from .. import settings as s
+from .. import runner
 
 
 router = APIRouter(prefix="/api/inventory", tags=["inventory"])
@@ -20,6 +21,10 @@ router = APIRouter(prefix="/api/inventory", tags=["inventory"])
 
 class IdsRequest(BaseModel):
     ids: list[int] = Field(default_factory=list)
+
+
+class RetryPayRequest(BaseModel):
+    id: int
 
 
 class CheckRequest(IdsRequest):
@@ -137,3 +142,38 @@ def cpa_push(req: IdsRequest, user: str = CurrentUser):
         "fail": sum(1 for r in results if r.get("status") not in ("ok", "no_rt", "skipped", "missing")),
     }
     return {"results": results, "summary": summary}
+
+
+@router.post("/accounts/retry-pay")
+def retry_pay(req: RetryPayRequest, user: str = CurrentUser):
+    """为指定已注册账号重新触发 pay-only 支付流程。
+    前端「继续开通」按钮调用此接口。"""
+    db = get_db()
+    acc = db.get_registered_account(req.id)
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    email = (acc.get("email") or "").strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="账号缺少邮箱")
+    has_session = bool(acc.get("session_token") or acc.get("access_token"))
+    if not has_session:
+        raise HTTPException(status_code=400, detail="账号缺少 session 凭证，无法继续开通")
+
+    try:
+        cfg = json.loads(s.PAY_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"读取支付配置失败: {e}")
+    use_gopay = bool(cfg.get("gopay", {}).get("enabled") or cfg.get("use_gopay"))
+    use_paypal = not use_gopay
+
+    try:
+        result = runner.start(
+            mode="single",
+            paypal=use_paypal,
+            pay_only=True,
+            gopay=use_gopay,
+            pay_only_email=email,
+        )
+        return {"status": "started", "email": email, "runner": result}
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))

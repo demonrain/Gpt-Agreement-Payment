@@ -137,25 +137,29 @@ class GoPayCharger:
         # are computed by Stripe.js client-side; replay the captured values from
         # config.runtime or HAR. Without them confirm 400.
         self.runtime = runtime_cfg or {}
-        # separate session for non-chatgpt domains (avoid leaking chatgpt cookies)
+        _ua = (
+            self.cs.headers.get("User-Agent")
+            or "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_2_1) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+        )
+        # ext: curl_cffi 会话——用于 Stripe API（需要 Chrome TLS 指纹绕过 Cloudflare）
         self.ext = _new_session()
-        self.ext.headers.update({
-            "User-Agent": (
-                self.cs.headers.get("User-Agent")
-                or "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_2_1) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        })
+        self.ext.headers.update({"User-Agent": _ua, "Accept-Language": "en-US,en;q=0.9"})
+        # mt: 标准 requests 会话——用于 Midtrans/GoPay 域名
+        # curl_cffi 的 libcurl SOCKS5 实现在某些 gost 中继上对这些域名超时
+        self.mt = requests.Session()
+        self.mt.headers.update({"User-Agent": _ua, "Accept-Language": "en-US,en;q=0.9"})
         if proxy:
+            _px = {"http": proxy, "https": proxy}
             try:
-                self.cs.proxies = {"http": proxy, "https": proxy}
+                self.cs.proxies = _px
             except Exception:
                 pass
             try:
-                self.ext.proxies = {"http": proxy, "https": proxy}
+                self.ext.proxies = _px
             except Exception:
                 pass
+            self.mt.proxies = _px
 
     # ───── Step 1-4: ChatGPT/Stripe checkout ─────
 
@@ -369,10 +373,158 @@ class GoPayCharger:
     def _fetch_pm_redirect_snap_token(self, pm_url: str) -> str:
         """GET pm-redirects.stripe.com/authorize/... → 302 to midtrans.
         Extract snap_token from the Location header.
+
+        三级回退策略:
+          1. curl_cffi (30s) — 最快，Chrome TLS 指纹
+          2. Playwright 浏览器 (90s) — 处理 JS 质询 / IP 信誉问题
+          3. requests (30s) — 不同 TLS 指纹兜底
         """
-        r = self.ext.get(pm_url, allow_redirects=False, timeout=DEFAULT_TIMEOUT)
+        time.sleep(2)  # confirm 后稍等 Midtrans 事务就绪
+        nav_headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "cross-site",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+            "Referer": "https://checkout.stripe.com/",
+        }
+
+        # ── 策略 1: curl_cffi 快速尝试 ──
+        try:
+            self.log("[gopay] pm-redirects 策略1: curl_cffi (timeout=30s)")
+            r = self.ext.get(pm_url, allow_redirects=False, timeout=30, headers=nav_headers)
+            self.log(f"[gopay] pm-redirects curl_cffi 响应: status={r.status_code}")
+            return self._extract_snap_token_from_redirect(r)
+        except GoPayError:
+            raise
+        except Exception as e:
+            self.log(f"[gopay] pm-redirects curl_cffi 失败: {type(e).__name__}: {str(e)[:100]}")
+
+        # ── 策略 2: Playwright 浏览器导航 ──
+        try:
+            self.log("[gopay] pm-redirects 策略2: Playwright 浏览器 (timeout=90s)")
+            token = self._browser_fetch_snap_token(pm_url)
+            if token:
+                return token
+        except GoPayError:
+            raise
+        except Exception as e:
+            self.log(f"[gopay] pm-redirects Playwright 失败: {type(e).__name__}: {str(e)[:100]}")
+
+        # ── 策略 3: requests 兜底 ──
+        try:
+            self.log("[gopay] pm-redirects 策略3: requests (timeout=30s)")
+            fallback_s = requests.Session()
+            fallback_s.headers.update(nav_headers)
+            fallback_s.headers["User-Agent"] = self.ext.headers.get(
+                "User-Agent",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_2_1) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            )
+            proxy_url = (self.ext.proxies or {}).get("https") or (self.ext.proxies or {}).get("http")
+            if proxy_url:
+                fallback_s.proxies = {"http": proxy_url, "https": proxy_url}
+            r2 = fallback_s.get(pm_url, allow_redirects=False, timeout=30, verify=True)
+            self.log(f"[gopay] pm-redirects requests 响应: status={r2.status_code}")
+            return self._extract_snap_token_from_redirect(r2)
+        except GoPayError:
+            raise
+        except Exception as e2:
+            raise GoPayError(f"pm-redirects: 所有策略失败: {e2}") from e2
+
+    def _browser_fetch_snap_token(self, pm_url: str) -> str:
+        """通过 Playwright 浏览器导航 pm-redirects URL，等待重定向到 Midtrans 并提取 snap_token。
+        浏览器能处理 JS 质询且 Stripe 对真实浏览器流量更友好。
+        """
+        from urllib.parse import urlparse
+        proxy_url = (self.ext.proxies or {}).get("https") or (self.ext.proxies or {}).get("http")
+        pw_proxy = None
+        if proxy_url:
+            pp = urlparse(proxy_url)
+            # Playwright 不识别 socks5h://，转换为 socks5://
+            scheme = "socks5" if pp.scheme in ("socks5h", "socks5") else pp.scheme
+            pw_proxy = {"server": f"{scheme}://{pp.hostname}:{pp.port}"}
+            if pp.username:
+                pw_proxy["username"] = pp.username
+                pw_proxy["password"] = pp.password or ""
+
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.log("[gopay] Playwright 未安装，跳过浏览器策略")
+            return ""
+
+        snap_token = ""
+        with sync_playwright() as pw:
+            launch_args = {"headless": True}
+            if pw_proxy:
+                launch_args["proxy"] = pw_proxy
+            browser = pw.chromium.launch(**launch_args)
+            try:
+                ctx = browser.new_context(
+                    user_agent=(
+                        self.ext.headers.get("User-Agent")
+                        or "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_2_1) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+                    ),
+                    locale="en-US",
+                )
+                page = ctx.new_page()
+                self.log(f"[gopay] 浏览器打开: {pm_url[:80]}...")
+                resp = page.goto(pm_url, wait_until="domcontentloaded", timeout=90000)
+                final_url = page.url
+                self.log(f"[gopay] 浏览器最终 URL: {final_url[:120]}")
+                # 情况 1: 302 重定向到 Midtrans，浏览器自动跟随
+                m = re.search(r"app\.midtrans\.com/snap/v[14]/redirection/([a-f0-9-]{36})", final_url)
+                if m:
+                    snap_token = m.group(1)
+                    self.log(f"[gopay] 浏览器成功提取 snap_token={snap_token}")
+                    return snap_token
+                # 情况 2: 页面可能还在 pm-redirects 上（JS 延迟重定向）
+                if "midtrans" not in final_url:
+                    self.log("[gopay] 等待 Midtrans 重定向 (max 30s)...")
+                    try:
+                        page.wait_for_url("**/midtrans.com/**", timeout=30000)
+                        final_url = page.url
+                        m = re.search(r"app\.midtrans\.com/snap/v[14]/redirection/([a-f0-9-]{36})", final_url)
+                        if m:
+                            snap_token = m.group(1)
+                            self.log(f"[gopay] 浏览器 JS 重定向后提取 snap_token={snap_token}")
+                            return snap_token
+                    except Exception:
+                        pass
+                # 情况 3: 检查页面内容是否有 snap_token
+                try:
+                    body = page.content()
+                    m = re.search(r"snap/v[14]/redirection/([a-f0-9-]{36})", body)
+                    if m:
+                        snap_token = m.group(1)
+                        self.log(f"[gopay] 从页面内容提取 snap_token={snap_token}")
+                        return snap_token
+                except Exception:
+                    pass
+                if not snap_token:
+                    status = resp.status if resp else "N/A"
+                    raise GoPayError(
+                        f"pm-redirects 浏览器: 未能提取 snap_token, status={status}, url={final_url[:120]}"
+                    )
+            finally:
+                browser.close()
+        return snap_token
+
+    @staticmethod
+    def _extract_snap_token_from_redirect(r) -> str:
+        """从 302 响应的 Location 头提取 Midtrans snap_token。"""
         if r.status_code not in (301, 302, 303, 307, 308):
-            raise GoPayError(f"pm-redirects: expected redirect, got {r.status_code}")
+            body_preview = ""
+            try:
+                body_preview = (r.text or "")[:300]
+            except Exception:
+                pass
+            raise GoPayError(
+                f"pm-redirects: expected redirect, got {r.status_code} body={body_preview}"
+            )
         loc = r.headers.get("Location", "")
         m = re.search(r"app\.midtrans\.com/snap/v[14]/redirection/([a-f0-9-]{36})", loc)
         if not m:
@@ -381,7 +533,7 @@ class GoPayCharger:
 
     def _midtrans_load_transaction(self, snap_token: str):
         """Optional: load transaction page so any session cookies get set."""
-        r = self.ext.get(
+        r = self.mt.get(
             f"https://app.midtrans.com/snap/v1/transactions/{snap_token}",
             headers={
                 "x-source": "snap",
@@ -420,7 +572,7 @@ class GoPayCharger:
         }
         last_err: Optional[str] = None
         for attempt in range(1, LINK_RETRY_LIMIT + 2):
-            r = self.ext.post(url, json=body, headers=headers, timeout=DEFAULT_TIMEOUT)
+            r = self.mt.post(url, json=body, headers=headers, timeout=DEFAULT_TIMEOUT)
             if r.status_code == 201:
                 data = r.json()
                 m = re.search(r"reference=([a-f0-9-]{36})", data.get("activation_link_url", ""))
@@ -451,7 +603,7 @@ class GoPayCharger:
     # ───── Step 8-12: GoPay linking ─────
 
     def _gopay_validate_reference(self, reference_id: str):
-        r = self.ext.post(
+        r = self.mt.post(
             "https://gwa.gopayapi.com/v1/linking/validate-reference",
             json={"reference_id": reference_id},
             headers={"Origin": "https://merchants-gws-app.gopayapi.com",
@@ -463,7 +615,7 @@ class GoPayCharger:
             raise GoPayError(f"validate-reference failed: {r.text[:300]}")
 
     def _gopay_user_consent(self, reference_id: str):
-        r = self.ext.post(
+        r = self.mt.post(
             "https://gwa.gopayapi.com/v1/linking/user-consent",
             json={"reference_id": reference_id},
             headers={"Origin": "https://merchants-gws-app.gopayapi.com",
@@ -478,7 +630,7 @@ class GoPayCharger:
 
     def _gopay_validate_otp(self, reference_id: str, otp: str) -> tuple[str, str]:
         """Returns (challenge_id, client_id) for PIN tokenization."""
-        r = self.ext.post(
+        r = self.mt.post(
             "https://gwa.gopayapi.com/v1/linking/validate-otp",
             json={"reference_id": reference_id, "otp": otp},
             headers={"Origin": "https://merchants-gws-app.gopayapi.com",
@@ -501,7 +653,7 @@ class GoPayCharger:
 
     def _tokenize_pin(self, challenge_id: str, client_id: str) -> str:
         """POST customer.gopayapi.com/api/v1/users/pin/tokens/nb → JWT."""
-        r = self.ext.post(
+        r = self.mt.post(
             "https://customer.gopayapi.com/api/v1/users/pin/tokens/nb",
             json={"challenge_id": challenge_id, "client_id": client_id, "pin": self.pin},
             headers={
@@ -534,7 +686,7 @@ class GoPayCharger:
         return token
 
     def _gopay_validate_pin(self, reference_id: str, pin_token: str):
-        r = self.ext.post(
+        r = self.mt.post(
             "https://gwa.gopayapi.com/v1/linking/validate-pin",
             json={"reference_id": reference_id, "token": pin_token},
             headers={"Origin": "https://merchants-gws-app.gopayapi.com",
@@ -557,7 +709,7 @@ class GoPayCharger:
             "Origin": "https://app.midtrans.com",
             "Referer": f"https://app.midtrans.com/snap/v4/redirection/{snap_token}",
         }
-        r = self.ext.post(
+        r = self.mt.post(
             url,
             json={"payment_type": "gopay", "tokenization": "true", "promo_details": None},
             headers=headers, timeout=DEFAULT_TIMEOUT,
@@ -577,7 +729,7 @@ class GoPayCharger:
     def _gopay_payment_validate(self, charge_ref: str):
         # midtrans 创建 charge 后 GoPay 后端要数秒才能 fetch；轮询直到 ready
         for i in range(8):
-            r = self.ext.get(
+            r = self.mt.get(
                 f"https://gwa.gopayapi.com/v1/payment/validate?reference_id={charge_ref}",
                 headers={"Origin": "https://merchants-gws-app.gopayapi.com",
                          "Referer": "https://merchants-gws-app.gopayapi.com/"},
@@ -590,7 +742,7 @@ class GoPayCharger:
 
     def _gopay_payment_confirm(self, charge_ref: str) -> tuple[str, str]:
         """Returns (challenge_id, client_id) for the charge PIN."""
-        r = self.ext.post(
+        r = self.mt.post(
             f"https://gwa.gopayapi.com/v1/payment/confirm?reference_id={charge_ref}",
             json={"payment_instructions": []},
             headers={"Origin": "https://merchants-gws-app.gopayapi.com",
@@ -605,7 +757,7 @@ class GoPayCharger:
         return ch.get("challenge_id", ""), ch.get("client_id", "")
 
     def _gopay_payment_process(self, charge_ref: str, pin_token: str):
-        r = self.ext.post(
+        r = self.mt.post(
             f"https://gwa.gopayapi.com/v1/payment/process?reference_id={charge_ref}",
             json={
                 "challenge": {

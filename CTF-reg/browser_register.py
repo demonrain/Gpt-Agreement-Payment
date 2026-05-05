@@ -75,11 +75,38 @@ def _parse_proxy(proxy_url: str):
             raise RuntimeError(
                 f"需要 gost 中继: gost -L=socks5://:{relay_port} -F={proxy_url}"
             )
+    # Firefox 原生通过 SOCKS5 做远程 DNS，不识别 socks5h:// 协议
+    scheme = "socks5" if pp.scheme == "socks5h" else pp.scheme
     return {
-        "server": f"{pp.scheme}://{pp.hostname}:{pp.port}",
+        "server": f"{scheme}://{pp.hostname}:{pp.port}",
         "username": pp.username or "",
         "password": pp.password or "",
     }
+
+
+def _resolve_proxy_ip(proxy_url: str) -> Optional[str]:
+    """通过代理获取出口 IP。使用 socks5h:// 确保远程 DNS 解析。"""
+    if not proxy_url:
+        return None
+    import requests as _req
+    pp = urlparse(proxy_url)
+    # 构造 socks5h:// URL 让 requests 走远程 DNS
+    h_url = f"socks5h://{pp.hostname}:{pp.port}"
+    if pp.username:
+        h_url = f"socks5h://{pp.username}:{pp.password}@{pp.hostname}:{pp.port}"
+    proxies = {"http": h_url, "https": h_url}
+    for api in ("https://api.ipify.org", "https://checkip.amazonaws.com", "https://icanhazip.com"):
+        try:
+            r = _req.get(api, proxies=proxies, timeout=10, verify=False)
+            r.raise_for_status()
+            ip = r.text.strip()
+            if ip:
+                logger.info(f"[browser-reg] 代理出口 IP: {ip}")
+                return ip
+        except Exception:
+            continue
+    logger.warning("[browser-reg] 无法通过代理获取出口 IP，将跳过 geoip")
+    return None
 
 
 def browser_register(cfg, mail_provider) -> dict:
@@ -103,6 +130,8 @@ def browser_register(cfg, mail_provider) -> dict:
     logger.info(f"[browser-reg] 密码: {password}  姓名: {first_name} {last_name}")
 
     cf_proxy = _parse_proxy(cfg.proxy)
+    # 预解析代理出口 IP，避免 Camoufox 内部用 socks5:// 做 GeoIP 查询失败
+    proxy_ip = _resolve_proxy_ip(cfg.proxy)
     has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
     tmp_profile = tempfile.mkdtemp(prefix="chatgpt_reg_")
@@ -129,7 +158,7 @@ def browser_register(cfg, mail_provider) -> dict:
             os="windows",
             screen=Screen(max_width=1920, max_height=1080),
             proxy=cf_proxy,
-            geoip=True,
+            geoip=proxy_ip or True,
             locale="en-US",
         ) as ctx:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -233,6 +262,8 @@ def browser_register(cfg, mail_provider) -> dict:
                     b.click()
                     logger.info(f"[browser-reg] 点击 email 继续: {sel}")
                     break
+            # 邮箱提交后 OpenAI 立即发验证码，记录时间点用于 OTP 过滤
+            otp_sent_at = time.time()
             time.sleep(3)
 
             # [3] 填密码（新账号会看到密码框）
@@ -283,7 +314,6 @@ def browser_register(cfg, mail_provider) -> dict:
             if page.query_selector('input[autocomplete="one-time-code"]') or \
                page.query_selector('input[inputmode="numeric"]'):
                 logger.info("[browser-reg] 等待 IMAP OTP ...")
-                otp_sent_at = time.time()
                 try:
                     otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "180")))
                 except Exception:

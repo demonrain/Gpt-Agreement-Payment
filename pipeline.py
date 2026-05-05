@@ -854,6 +854,9 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
         card_cfg = _read_card_cfg(card_config_path)
     cardw_config_path = _load_cardw_path_from_card_cfg(card_cfg, cardw_config_path)
 
+    # single 模式也需要确保 gost 按 lock_country 配置运行
+    _ensure_gost_alive(card_cfg, team_client)
+
     # 内部 fallback：如果外部没传 pool/team/proxy，也自动构造（单次调用场景）
     owned_pool = False
     if pool is None:
@@ -1269,6 +1272,21 @@ def _paid_or_consumed_emails() -> set[str]:
     return consumed
 
 
+def _find_registered_account_by_email(email: str) -> dict | None:
+    """按邮箱精确查找已注册账号。WebUI「继续开通」功能使用。"""
+    target = _norm_email(email)
+    if not target:
+        return None
+    accounts = _load_registered_accounts()
+    for acc in reversed(accounts):
+        if not isinstance(acc, dict):
+            continue
+        if _norm_email(acc.get("email")) == target:
+            if acc.get("session_token") or acc.get("access_token"):
+                return dict(acc)
+    return None
+
+
 def _select_recent_registered_account_for_pay_only() -> dict | None:
     """Pick the newest registered account that has not already succeeded.
 
@@ -1300,7 +1318,8 @@ def _select_recent_registered_account_for_pay_only() -> dict | None:
 
 
 def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
-             gopay_otp_file=None, timeout_pay=600, prefer_recent=True):
+             gopay_otp_file=None, timeout_pay=600, prefer_recent=True,
+             target_email=""):
     """Retry payment only.
 
     Default behavior is now:
@@ -1309,10 +1328,14 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
       2. fall back to credentials embedded in the payment config if no reusable
          account exists.
 
-    This preserves the old config-token path while preventing freshly
-    registered-but-unpaid accounts from being wasted.
+    target_email: 指定为某个已注册邮箱执行 pay-only（WebUI「继续开通」功能）。
     """
-    account = _select_recent_registered_account_for_pay_only() if prefer_recent else None
+    if target_email:
+        account = _find_registered_account_by_email(target_email)
+        if not account:
+            raise RuntimeError(f"未找到邮箱 {target_email} 的注册记录或缺少 session 凭证")
+    else:
+        account = _select_recent_registered_account_for_pay_only() if prefer_recent else None
     email = _norm_email(account.get("email")) if account else ""
     try:
         card_cfg = _read_card_cfg(card_config_path)
@@ -2296,6 +2319,18 @@ class WebshareClient:
             raise RuntimeError("Webshare 代理列表为空")
         return results[0]
 
+    def get_proxy_by_country(self, country_code: str) -> dict | None:
+        """获取指定国家的第一个有效代理。无匹配时返回 None。"""
+        cc = _normalize_country(country_code)
+        with self._req(f"/proxy/list/?mode=direct&page=1&page_size=5&country_code__in={cc}") as r:
+            data = json.loads(r.read().decode())
+        for p in (data.get("results") or []):
+            if p.get("valid"):
+                return p
+        # 无有效代理则返回第一个（可能 valid=False 但仍可尝试）
+        results = data.get("results") or []
+        return results[0] if results else None
+
     def wait_for_fresh_proxy(self, prev_ip: str = "", max_wait_s: int = 120,
                               poll_interval_s: int = 5) -> dict:
         """轮询直到：valid=True 且 ip != prev_ip。返回 proxy 字典。"""
@@ -2366,10 +2401,19 @@ def _swap_gost_relay(new_ip: str, new_port: int, username: str, password: str,
     print(f"[gost] 启动新中继 PID={p.pid}  {upstream}")
 
 
+_COUNTRY_ALIAS = {"UK": "GB", "USA": "US", "KR": "KR", "JP": "JP"}
+
+
+def _normalize_country(code: str) -> str:
+    """将常见国家代码别名转为 ISO 3166-1 alpha-2（Webshare API 要求）。"""
+    c = code.strip().upper()
+    return _COUNTRY_ALIAS.get(c, c)
+
+
 def _ensure_gost_alive(card_cfg: dict, team_client=None) -> bool:
-    """启动/循环前调。检 listen_port 是否有进程监听；没的话从 Webshare API 拿
-    当前 IP 自动拉起 gost + 同步 team 全局代理。成功返回 True，失败 False。
-    （不进行 refresh，只是拉起; refresh 留给 no_perm 触发路径）"""
+    """启动/循环前调。检 listen_port 是否有进程监听且代理国家匹配 lock_country；
+    不匹配或未监听时从 Webshare API 拿匹配 lock_country 的 IP 自动拉起 gost。
+    成功返回 True，失败 False。"""
     ws_cfg = (card_cfg or {}).get("webshare") or {}
     if not ws_cfg.get("enabled"):
         return False
@@ -2377,20 +2421,50 @@ def _ensure_gost_alive(card_cfg: dict, team_client=None) -> bool:
     listen_port = int(ws_cfg.get("gost_listen_port", 18898))
     if not api_key:
         return False
-    # 已监听则跳
+    lock_country = _normalize_country((ws_cfg.get("lock_country") or ""))
+
+    already_listening = False
     try:
         ck = subprocess.run(["ss", "-ltn", f"sport = :{listen_port}"],
                              capture_output=True, text=True, timeout=3)
-        if f":{listen_port}" in ck.stdout:
-            return True
+        already_listening = f":{listen_port}" in ck.stdout
     except Exception:
         pass
-    print(f"[gost] listen :{listen_port} 无监听，自动拉起")
+
+    client = None
     try:
         client = WebshareClient(api_key)
-        px = client.get_current_proxy()
     except Exception as e:
-        print(f"[gost] 查询 Webshare 当前 IP 失败: {e}")
+        print(f"[gost] WebshareClient 初始化失败: {e}")
+        return already_listening
+
+    # 验证当前代理国家是否匹配 lock_country
+    if already_listening and lock_country:
+        try:
+            px = client.get_current_proxy()
+            cur_country = _normalize_country(px.get("country_code") or "")
+            if cur_country == lock_country:
+                return True
+            print(f"[gost] 当前代理国家={cur_country} 不匹配 lock_country={lock_country}，重新拉起")
+        except Exception as e:
+            print(f"[gost] 查询当前代理国家失败: {e}，保持现状")
+            return True
+    elif already_listening:
+        return True
+
+    if not already_listening:
+        print(f"[gost] listen :{listen_port} 无监听，自动拉起")
+
+    # 获取匹配 lock_country 的代理
+    px = None
+    try:
+        if lock_country:
+            # 先尝试获取指定国家的代理
+            px = client.get_proxy_by_country(lock_country)
+        if not px:
+            px = client.get_current_proxy()
+    except Exception as e:
+        print(f"[gost] 查询 Webshare IP 失败: {e}")
         return False
     upstream_scheme = str(ws_cfg.get("gost_upstream_scheme", "http"))
     try:
@@ -2401,6 +2475,7 @@ def _ensure_gost_alive(card_cfg: dict, team_client=None) -> bool:
     except Exception as e:
         print(f"[gost] 拉起失败: {e}")
         return False
+    print(f"[gost] 代理国家={px.get('country_code', '?')} IP={px['proxy_address']}")
     # 同步 team 全局代理
     if team_client and ws_cfg.get("sync_team_proxy", True):
         team_scheme = str(ws_cfg.get("team_proxy_scheme", "socks5"))
@@ -2438,7 +2513,7 @@ def _rotate_webshare_ip(card_cfg: dict, team_client=None, prev_ip: str = "") -> 
     except Exception as e:
         print(f"[Webshare] 查询额度异常（继续 refresh）: {e}")
 
-    lock_country = str(ws_cfg.get("lock_country", "")).strip().upper()
+    lock_country = _normalize_country(str(ws_cfg.get("lock_country", "")))
     if lock_country:
         print(f"[Webshare] refresh pool，锁国家={lock_country}（prev_ip={prev_ip or '?'}）")
     else:
@@ -3343,6 +3418,8 @@ def main():
                         help="仅注册，不支付")
     parser.add_argument("--pay-only", action="store_true",
                         help="仅支付（优先复用最近注册但未支付账号；没有则使用配置文件中的 session_token）")
+    parser.add_argument("--pay-only-email", type=str, default="",
+                        help="指定为某个已注册邮箱执行 pay-only（配合 --pay-only 使用）")
     parser.add_argument("--batch", type=int, default=0,
                         help="批量运行 N 次")
     parser.add_argument("--delay", type=float, default=30,
@@ -3414,6 +3491,7 @@ def main():
                 use_paypal=args.paypal,
                 use_gopay=args.gopay,
                 gopay_otp_file=args.gopay_otp_file,
+                target_email=getattr(args, "pay_only_email", "") or "",
             )
             print(f"\n结果: {result.get('status', '?')}")
 

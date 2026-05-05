@@ -179,6 +179,7 @@
               <span class="badge" :class="payBadgeClass(acc.pay_state)">{{ payStateLabel(acc) }}</span>
               <span class="badge" :class="rtBadgeClass(acc.rt_state)">{{ rtStateLabel(acc) }}</span>
               <span class="badge" :class="cpaBadgeClass(acc)" :title="acc.cpa_status">{{ cpaLabel(acc) }}</span>
+              <button v-if="acc.pay_only_eligible" class="inventory-row-action retry-pay-btn" :disabled="inventoryBusy || status.running" @click="retryPay(acc)">继续开通</button>
               <button v-if="!acc.cpa_pushed" class="inventory-row-action" :disabled="inventoryBusy" @click="pushOneToCpa(acc.id)">推送→CPA</button>
             </div>
             <div class="inventory-row-sub">
@@ -677,6 +678,25 @@ function pushOneToCpa(id: number) { pushCpa([id], "推送 CPA"); }
 function pushSelectedToCpa() { pushCpa(Array.from(selectedIds.value), "批量推送选中"); }
 function pushAllUnpushed() { pushCpa(unpushedIds.value, "推送所有未推送"); }
 
+async function retryPay(acc: InventoryAccount) {
+  if (status.value.running) {
+    message.warning("当前有任务正在运行，请等待完成后再试");
+    return;
+  }
+  inventoryBusy.value = true;
+  try {
+    await api.post("/inventory/accounts/retry-pay", { id: acc.id });
+    message.success(`已为 ${acc.email} 启动支付流程`);
+    await refreshStatus();
+    if (status.value.running) openStream();
+  } catch (e: any) {
+    const detail = e?.response?.data?.detail;
+    message.error(`继续开通失败：${typeof detail === "string" ? detail : detail?.message || e?.message || "未知错误"}`);
+  } finally {
+    inventoryBusy.value = false;
+  }
+}
+
 async function refreshInventory() {
   if (inventoryLoading.value) return;
   inventoryLoading.value = true;
@@ -1172,6 +1192,14 @@ onBeforeUnmount(() => {
 .inventory-row-action:disabled {
   opacity: .5;
   cursor: not-allowed;
+}
+.retry-pay-btn {
+  border-color: #16a34a;
+  color: #16a34a;
+}
+.retry-pay-btn:hover:not(:disabled) {
+  background: #16a34a;
+  color: #fff;
 }
 @keyframes pulse {
   0%, 100% { opacity: 0.4; }
