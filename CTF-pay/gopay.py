@@ -654,6 +654,7 @@ class GoPayCharger:
 
     def _gopay_validate_otp(self, reference_id: str, otp: str) -> tuple[str, str]:
         """Returns (challenge_id, client_id) for PIN tokenization."""
+        self.log(f"[gopay] validate-otp ref={reference_id[:12]}… otp={otp}")
         r = self.mt.post(
             "https://gwa.gopayapi.com/v1/linking/validate-otp",
             json={"reference_id": reference_id, "otp": otp},
@@ -661,6 +662,8 @@ class GoPayCharger:
                      "Referer": "https://merchants-gws-app.gopayapi.com/"},
             timeout=DEFAULT_TIMEOUT,
         )
+        if r.status_code != 200:
+            self.log(f"[gopay] validate-otp failed: status={r.status_code} body={r.text[:500]}")
         r.raise_for_status()
         data = r.json()
         if not data.get("success"):
