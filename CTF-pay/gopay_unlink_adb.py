@@ -5,12 +5,10 @@
 
 本模块通过 ADB 操控 GoPay 应用 UI 来完成自动 Unlink。
 
-流程:
-  1. 启动 GoPay 应用
-  2. 导航到 "探索" → "已关联应用" 或 "设置" → "已关联应用"
-  3. 找到 OpenAI 条目
-  4. 点击取消关联
-  5. 确认取消
+导航路径（基于 GoPay App 2026-05 UI）:
+  Profile 页 → Account & app settings → Linked apps → OpenAI → Unlink → 确认
+
+重要：GoPay 的 UI 元素全部使用 content-desc 属性（而非 text）。
 """
 from __future__ import annotations
 
@@ -61,7 +59,10 @@ def _dump_ui(serial: str) -> str:
 
 
 def _find_node(xml_str: str, **attrs) -> dict | None:
-    """在 UI XML 中查找匹配属性的第一个节点，返回 bounds 中心坐标。"""
+    """在 UI XML 中查找匹配属性的第一个节点，返回 bounds 中心坐标。
+
+    attrs 的值可以是 str（子串匹配）或 re.Pattern（正则匹配）。
+    """
     if not xml_str:
         return None
     try:
@@ -94,52 +95,31 @@ def _find_node(xml_str: str, **attrs) -> dict | None:
     return None
 
 
-def _find_all_nodes(xml_str: str, **attrs) -> list[dict]:
-    """查找所有匹配节点。"""
-    results = []
+def _find_by_desc(xml_str: str, pattern: re.Pattern) -> dict | None:
+    """按 content-desc 匹配查找节点（GoPay 的 UI 标签全部在 content-desc 中）。"""
+    return _find_node(xml_str, **{"content-desc": pattern})
+
+
+def _dump_all_descs(xml_str: str) -> list[str]:
+    """提取所有非空 content-desc 值（用于调试）。"""
     if not xml_str:
-        return results
+        return []
     try:
         root = ET.fromstring(xml_str)
     except ET.ParseError:
-        return results
+        return []
+    descs = []
     for elem in root.iter("node"):
-        matched = True
-        for key, pattern in attrs.items():
-            val = elem.get(key, "")
-            if isinstance(pattern, re.Pattern):
-                if not pattern.search(val):
-                    matched = False
-                    break
-            elif pattern not in val:
-                matched = False
-                break
-        if matched:
-            bounds = elem.get("bounds", "")
-            m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
-            if m:
-                x1, y1, x2, y2 = map(int, m.groups())
-                results.append({
-                    "x": (x1 + x2) // 2,
-                    "y": (y1 + y2) // 2,
-                    "text": elem.get("text", ""),
-                    "content-desc": elem.get("content-desc", ""),
-                    "resource-id": elem.get("resource-id", ""),
-                })
-    return results
+        desc = elem.get("content-desc", "").strip()
+        if desc:
+            descs.append(desc.replace("\n", " | "))
+    return descs
 
 
-def _wait_for_node(serial: str, timeout: float, interval: float, log: Callable, label: str, **attrs) -> dict | None:
-    """等待 UI 节点出现。"""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        xml = _dump_ui(serial)
-        node = _find_node(xml, **attrs)
-        if node:
-            return node
-        time.sleep(interval)
-    log(f"[unlink] 等待 {label} 超时 ({timeout}s)")
-    return None
+def _tap_node(serial: str, node: dict, log: Callable, label: str) -> None:
+    """点击节点并记录日志。"""
+    log(f"[unlink] 点击 {label}: ({node['x']}, {node['y']})")
+    _tap(serial, node["x"], node["y"])
 
 
 def gopay_unlink_openai(
@@ -152,108 +132,139 @@ def gopay_unlink_openai(
     Returns:
         {"ok": True/False, "message": str}
     """
-    interval = 2.0
-
     log(f"[unlink] 开始 GoPay unlink OpenAI (device={serial})")
 
-    # Step 1: 启动 GoPay 应用
-    _shell(serial, "am", "start", "-n",
-           "com.gojek.gopay/com.gojek.gopay.activity.MainActivity")
-    time.sleep(3)
-
-    # Step 2: 尝试找到并进入已关联应用页面
-    # GoPay 的 UI 可能有多种路径，尝试搜索"设置"或齿轮图标
+    # Step 1: 强制停止再启动 GoPay，确保干净状态
+    _shell(serial, "am", "force-stop", "com.gojek.gopay")
+    time.sleep(1)
+    _shell(serial, "am", "start", "-n", "com.gojek.gopay/.MainActivity")
+    time.sleep(5)
     xml = _dump_ui(serial)
 
-    # 方法A: 通过底部导航的"我的"/"Profil"/"Profile" tab
-    profile_tab = (
-        _find_node(xml, text=re.compile(r"(?i)profil|profile|我的|akun|saya"))
-        or _find_node(xml, **{"content-desc": re.compile(r"(?i)profil|profile|我的|akun")})
-    )
+    # Step 2: 定位 Profile tab 并导航到 Account 页面
+    # GoPay 启动后默认在 Home 页面，需要先切到 Profile tab
+    profile_tab = _find_by_desc(xml, re.compile(r"(?i)^profile$"))
     if profile_tab:
-        log(f"[unlink] 找到 Profile tab: ({profile_tab['x']}, {profile_tab['y']})")
-        _tap(serial, profile_tab["x"], profile_tab["y"])
-        time.sleep(2)
+        _tap_node(serial, profile_tab, log, "Profile tab")
+        time.sleep(3)
         xml = _dump_ui(serial)
+    else:
+        log(f"[unlink] 当前页面元素: {_dump_all_descs(xml)[:15]}")
 
-    # 查找"设置"/"Settings"/"Pengaturan"
-    settings_node = (
-        _find_node(xml, text=re.compile(r"(?i)setting|设置|pengaturan|setelan"))
-        or _find_node(xml, **{"content-desc": re.compile(r"(?i)setting|设置|pengaturan")})
-    )
-    if settings_node:
-        log(f"[unlink] 找到 Settings: ({settings_node['x']}, {settings_node['y']})")
-        _tap(serial, settings_node["x"], settings_node["y"])
-        time.sleep(2)
-        xml = _dump_ui(serial)
-
-    # 查找"已关联应用"/"Linked Apps"/"Aplikasi Terhubung"
-    linked_node = _find_node(xml, text=re.compile(
-        r"(?i)linked\s*app|已关联|terhubung|tertaut|connected\s*app"
+    # Step 3: 找到并点击 "Account & app settings"
+    # content-desc 包含完整描述: "Account & app settings\nControl your app preferences..."
+    settings_node = _find_by_desc(xml, re.compile(
+        r"(?i)account\s*&?\s*app\s*setting"
     ))
-    if not linked_node:
-        # 尝试向下滑动后再找
-        _shell(serial, "input", "swipe", "300", "800", "300", "400", "300")
-        time.sleep(1)
+    if not settings_node:
+        # 可能在 Profile 页面下面，先滑动
+        _shell(serial, "input", "swipe", "450", "1200", "450", "400", "300")
+        time.sleep(2)
         xml = _dump_ui(serial)
-        linked_node = _find_node(xml, text=re.compile(
-            r"(?i)linked\s*app|已关联|terhubung|tertaut|connected\s*app"
+        settings_node = _find_by_desc(xml, re.compile(
+            r"(?i)account\s*&?\s*app\s*setting"
         ))
 
-    if not linked_node:
-        log("[unlink] 未找到「已关联应用」入口")
-        return {"ok": False, "message": "未找到「已关联应用」入口，GoPay UI 可能已变化"}
+    if not settings_node:
+        descs = _dump_all_descs(xml)
+        log(f"[unlink] 未找到 Account & app settings，当前页面元素: {descs[:15]}")
+        _back(serial)
+        return {"ok": False, "message": f"未找到 Account & app settings 入口。页面元素: {descs[:10]}"}
 
-    log(f"[unlink] 找到 Linked Apps: ({linked_node['x']}, {linked_node['y']})")
-    _tap(serial, linked_node["x"], linked_node["y"])
+    _tap_node(serial, settings_node, log, "Account & app settings")
     time.sleep(2)
-
-    # Step 3: 查找 OpenAI 条目
     xml = _dump_ui(serial)
-    openai_node = _find_node(xml, text=re.compile(r"(?i)openai|open\s*ai|chatgpt"))
+
+    # Step 4: 找到并点击 "Linked apps"
+    linked_node = _find_by_desc(xml, re.compile(r"(?i)linked\s*app"))
+    if not linked_node:
+        _shell(serial, "input", "swipe", "450", "1000", "450", "400", "300")
+        time.sleep(1)
+        xml = _dump_ui(serial)
+        linked_node = _find_by_desc(xml, re.compile(r"(?i)linked\s*app"))
+
+    if not linked_node:
+        log("[unlink] 未找到 Linked apps 入口")
+        _back(serial)
+        return {"ok": False, "message": "未找到 Linked apps 入口"}
+
+    _tap_node(serial, linked_node, log, "Linked apps")
+
+    # Step 5: 等待 Linked apps 页面加载完成（数据异步加载）
+    openai_node = None
+    load_deadline = time.time() + 15
+    while time.time() < load_deadline:
+        time.sleep(2)
+        xml = _dump_ui(serial)
+        openai_node = _find_by_desc(xml, re.compile(r"(?i)openai|open\s*ai|chatgpt"))
+        if openai_node:
+            break
+        # 如果确认显示"无关联应用"则停止等待
+        no_apps = _find_by_desc(xml, re.compile(r"(?i)no\s*app.*linked"))
+        if no_apps:
+            log("[unlink] 已关联应用列表为空（已解绑或从未关联）")
+            _back(serial)
+            return {"ok": True, "message": "已关联应用列表为空（已解绑或从未关联）"}
+
     if not openai_node:
-        log("[unlink] 已关联应用列表中未找到 OpenAI 条目（可能已解绑）")
+        descs = _dump_all_descs(xml)
+        log(f"[unlink] Linked apps 页面加载后未找到 OpenAI，元素: {descs[:10]}")
+        _back(serial)
         return {"ok": True, "message": "已关联应用列表中未找到 OpenAI（已解绑或从未关联）"}
 
-    log(f"[unlink] 找到 OpenAI 条目: ({openai_node['x']}, {openai_node['y']})")
-    _tap(serial, openai_node["x"], openai_node["y"])
-    time.sleep(2)
+    # Step 6: 找到 OpenAI 条目旁的 Unlink 按钮
+    # GoPay UI 中 Unlink 按钮是 OpenAI 条目内的子按钮
+    unlink_btn = _find_node(xml, **{
+        "content-desc": re.compile(r"(?i)^unlink$"),
+        "class": "android.widget.Button",
+    })
+    if not unlink_btn:
+        # 回退：直接点击 OpenAI 条目
+        _tap_node(serial, openai_node, log, "OpenAI 条目")
+        time.sleep(2)
+        xml = _dump_ui(serial)
+        unlink_btn = _find_by_desc(xml, re.compile(r"(?i)unlink"))
 
-    # Step 4: 点击"取消关联"/"Unlink"/"Putuskan"
-    xml = _dump_ui(serial)
-    unlink_btn = _find_node(xml, text=re.compile(
-        r"(?i)unlink|取消关联|解除关联|putuskan|hapus|disconnect|remove"
-    ))
     if not unlink_btn:
         log("[unlink] 未找到 Unlink 按钮")
-        return {"ok": False, "message": "进入了 OpenAI 详情页但未找到 Unlink 按钮"}
+        _back(serial)
+        _back(serial)
+        return {"ok": False, "message": "找到 OpenAI 条目但未找到 Unlink 按钮"}
 
-    log(f"[unlink] 点击 Unlink: ({unlink_btn['x']}, {unlink_btn['y']})")
-    _tap(serial, unlink_btn["x"], unlink_btn["y"])
+    _tap_node(serial, unlink_btn, log, "Unlink")
     time.sleep(2)
 
-    # Step 5: 确认弹窗
+    # Step 7: 确认弹窗 — 查找确认 Unlink 按钮
     xml = _dump_ui(serial)
-    confirm_btn = (
-        _find_node(xml, text=re.compile(r"(?i)confirm|ya|yes|确认|确定|ok|lanjut"))
-        or _find_node(xml, text=re.compile(r"(?i)unlink|putuskan"))
-    )
-    if confirm_btn:
-        log(f"[unlink] 确认 Unlink: ({confirm_btn['x']}, {confirm_btn['y']})")
-        _tap(serial, confirm_btn["x"], confirm_btn["y"])
-        time.sleep(2)
+    confirm_dialog = _find_by_desc(xml, re.compile(r"(?i)unlink.*from.*gopay"))
+    if confirm_dialog:
+        # 确认弹窗出现，点击底部的 Unlink 确认按钮
+        confirm_btn = _find_node(xml, **{
+            "content-desc": re.compile(r"(?i)^unlink$"),
+            "class": "android.widget.Button",
+        })
+        if confirm_btn:
+            _tap_node(serial, confirm_btn, log, "确认 Unlink")
+            time.sleep(3)
+        else:
+            log("[unlink] 确认弹窗出现但未找到确认按钮")
+            _back(serial)
+            _back(serial)
+            return {"ok": False, "message": "确认弹窗出现但未找到确认按钮"}
+    else:
+        log("[unlink] 未出现确认弹窗，可能已直接解绑")
 
-    # Step 6: 验证是否成功
+    # Step 8: 验证结果
     xml = _dump_ui(serial)
-    still_linked = _find_node(xml, text=re.compile(r"(?i)openai|open\s*ai|chatgpt"))
-    if still_linked:
-        log("[unlink] 解绑后 OpenAI 仍在列表中，可能未成功")
-        return {"ok": False, "message": "执行了 Unlink 操作但 OpenAI 仍在列表中"}
+    no_apps = _find_by_desc(xml, re.compile(r"(?i)no\s*app.*linked"))
+    still_linked = _find_by_desc(xml, re.compile(r"(?i)openai|open\s*ai"))
+    if no_apps or not still_linked:
+        _back(serial)
+        _back(serial)
+        log("[unlink] GoPay OpenAI unlink 成功")
+        return {"ok": True, "message": "GoPay 已成功取消 OpenAI 关联"}
 
-    # 返回主界面
+    log("[unlink] 解绑后 OpenAI 仍在列表中，可能未成功")
     _back(serial)
-    time.sleep(1)
     _back(serial)
-
-    log("[unlink] GoPay OpenAI unlink 成功")
-    return {"ok": True, "message": "GoPay 已成功取消 OpenAI 关联"}
+    return {"ok": False, "message": "执行了 Unlink 操作但 OpenAI 仍在列表中"}
