@@ -959,6 +959,9 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
                 print(f"[CPA] 导入异常: {e}")
                 record["cpa_import"] = "error"
 
+        # Step 5: 支付成功 → 推送到 sub2api
+        _sub2api_auto_push(pay_status, record, reg, card_cfg)
+
         _append_result(record)
         emoji = "✓" if pay_status == "succeeded" else "✗"
         perm = record.get("invite_permission", "-")
@@ -1384,6 +1387,9 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
             except Exception as e:
                 print(f"[CPA] 导入异常: {e}")
                 record["cpa_import"] = "error"
+        # sub2api 自动推送（pay-only 路径）
+        reg_for_push = account if account else {"email": pay_email}
+        _sub2api_auto_push(status, record, reg_for_push, card_cfg)
         _append_result(record)
         return result
     except PaymentError as e:
@@ -2737,6 +2743,45 @@ def _find_team_id_from_results(email: str) -> str:
     except Exception as e:
         print(f"[self-dealer] 读 team_id 失败: {e}")
     return ""
+
+
+def _sub2api_auto_push(
+    pay_status: str,
+    record: dict,
+    reg: dict,
+    card_cfg: dict | None,
+) -> None:
+    """支付成功后自动推送到 sub2api（best-effort）。"""
+    if pay_status != "succeeded":
+        return
+    sa_cfg = (card_cfg or {}).get("sub2api") or {}
+    if not sa_cfg.get("enabled") or not sa_cfg.get("auto_push", True):
+        return
+    if not (sa_cfg.get("base_url") and sa_cfg.get("token")):
+        return
+    try:
+        from webui.backend.sub2api_push import push_to_sub2api
+    except ImportError:
+        # pipeline 直接运行时可能不在 webui 包路径下，改用内联方式
+        import sys, importlib, pathlib
+        _wb = str(pathlib.Path(__file__).resolve().parent / "webui" / "backend")
+        if _wb not in sys.path:
+            sys.path.insert(0, _wb)
+        try:
+            from sub2api_push import push_to_sub2api
+        except ImportError:
+            print("[sub2api] sub2api_push 模块未找到，跳过")
+            return
+    acc = dict(reg)
+    acc.setdefault("email", record.get("registration", {}).get("email", ""))
+    print(f"[sub2api] 自动推送 {acc.get('email', '?')} ...")
+    result = push_to_sub2api([acc], sa_cfg, log=print)
+    if result.get("ok"):
+        record["sub2api_import"] = f"ok (created={result.get('account_created', 0)})"
+        print(f"[sub2api] 推送成功: created={result.get('account_created', 0)}")
+    else:
+        record["sub2api_import"] = f"error: {result.get('error', '?')}"
+        print(f"[sub2api] 推送失败: {result.get('error', '?')}")
 
 
 def _cpa_import_after_team(

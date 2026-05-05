@@ -10,6 +10,8 @@ from ..preflight import captcha as captcha_check
 from ..preflight import vlm as vlm_check
 from ..preflight import team_system as ts_check
 from ..preflight import cpa as cpa_check
+from ..preflight import adb as adb_check
+from ..preflight import sub2api as sub2api_check
 
 router = APIRouter(prefix="/api/preflight", tags=["preflight"])
 
@@ -24,7 +26,14 @@ _REGISTRY = {
     "vlm": vlm_check.check,
     "team_system": ts_check.check,
     "cpa": cpa_check.check,
+    "adb": adb_check.check,
+    "sub2api": sub2api_check.check,
 }
+
+
+@router.get("/adb/devices")
+def adb_devices(user: str = CurrentUser):
+    return adb_check.list_devices()
 
 
 @router.post("/{name}")

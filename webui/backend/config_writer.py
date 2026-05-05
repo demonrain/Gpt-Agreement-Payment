@@ -51,11 +51,23 @@ def _project_pay(answers: dict) -> dict:
             }
             if gp.get("midtrans_client_id"):
                 out["gopay"]["midtrans_client_id"] = gp["midtrans_client_id"]
-            out["gopay"]["otp"] = {
-                "source": "auto",
+            otp_source = str(gp.get("otp_source") or "auto").strip().lower()
+            otp_block: dict = {
+                "source": otp_source,
                 "timeout": int(gp.get("otp_timeout") or 300),
-                "interval": 1,
+                "interval": int(gp.get("otp_interval") or (3 if otp_source in ("adb", "appium") else 1)),
             }
+            if otp_source == "adb":
+                if gp.get("adb_serial"):
+                    otp_block["adb_serial"] = str(gp["adb_serial"])
+            elif otp_source == "appium":
+                if gp.get("appium_url"):
+                    otp_block["appium_url"] = str(gp["appium_url"])
+                if gp.get("adb_serial"):
+                    otp_block["adb_serial"] = str(gp["adb_serial"])
+            out["gopay"]["otp"] = otp_block
+            if gp.get("auto_unlink"):
+                out["gopay"]["auto_unlink"] = True
     if "team_plan" in answers:
         tp = answers["team_plan"] or {}
         plan: dict = {}
@@ -76,6 +88,16 @@ def _project_pay(answers: dict) -> dict:
                 plan[k] = tp[k]
         if plan:
             out["fresh_checkout"] = {"plan": plan}
+    if "sub2api" in answers:
+        sa = answers["sub2api"] or {}
+        sub_block: dict = {"enabled": bool(sa.get("enabled", False))}
+        if sa.get("base_url"):
+            sub_block["base_url"] = str(sa["base_url"]).rstrip("/")
+        if sa.get("token"):
+            sub_block["token"] = str(sa["token"])
+        sub_block["auto_push"] = bool(sa.get("auto_push", True))
+        sub_block["skip_default_group_bind"] = bool(sa.get("skip_default_group_bind", True))
+        out["sub2api"] = sub_block
     if "daemon" in answers:
         out["daemon"] = answers["daemon"]
     if "stripe_runtime" in answers and pm in ("card", "both"):

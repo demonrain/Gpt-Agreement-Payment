@@ -311,26 +311,39 @@ def _check_payment_config(checks: list[dict], req: dict, pay_cfg: dict) -> None:
         else:
             _check(checks, "gopay_config", "ok", "GoPay 支付配置已配置", blocking=False)
 
-        wa = wa_relay.status()
-        if wa.get("status") == "connected":
+        otp_cfg = gp.get("otp") or gp.get("otp_provider") or {}
+        otp_source = str(otp_cfg.get("source") or otp_cfg.get("type") or "").strip().lower() if isinstance(otp_cfg, dict) else ""
+        # adb / appium 不依赖 WhatsApp relay，无需检查连接状态
+        if otp_source in ("adb", "appium"):
             _check(
                 checks,
                 "whatsapp_relay",
                 "ok",
-                "WhatsApp relay 已连接，可自动接收 GoPay OTP",
-                details=f"engine={wa.get('engine')}",
+                f"GoPay OTP 已配置 {otp_source} 自动获取，无需 WhatsApp relay",
+                details=f"otp_source={otp_source}",
                 blocking=False,
             )
         else:
-            _check(
-                checks,
-                "whatsapp_relay",
-                "warn",
-                "WhatsApp relay 当前未连接；GoPay OTP 将等待自动 relay 或前端手动补录",
-                details=f"status={wa.get('status')}",
-                blocking=False,
-                action="如需自动接收 GoPay OTP，先打开 WhatsApp 登录入口扫码连接",
-            )
+            wa = wa_relay.status()
+            if wa.get("status") == "connected":
+                _check(
+                    checks,
+                    "whatsapp_relay",
+                    "ok",
+                    "WhatsApp relay 已连接，可自动接收 GoPay OTP",
+                    details=f"engine={wa.get('engine')}",
+                    blocking=False,
+                )
+            else:
+                _check(
+                    checks,
+                    "whatsapp_relay",
+                    "warn",
+                    "WhatsApp relay 当前未连接；GoPay OTP 将等待自动 relay 或前端手动补录",
+                    details=f"status={wa.get('status')}",
+                    blocking=False,
+                    action="如需自动接收 GoPay OTP，先打开 WhatsApp 登录入口扫码连接",
+                )
         return
 
     if kind == "paypal":
@@ -445,6 +458,27 @@ def _check_cpa(checks: list[dict], req: dict, pay_cfg: dict) -> None:
         _check(checks, "cpa_config", "ok", "CPA 配置已配置", blocking=False)
 
 
+def _check_sub2api(checks: list[dict], req: dict, pay_cfg: dict) -> None:
+    sa = pay_cfg.get("sub2api") if isinstance(pay_cfg.get("sub2api"), dict) else {}
+    if not sa.get("enabled"):
+        return
+    required = ["base_url", "token"]
+    missing = [f"sub2api.{p}" for p in required if _is_missing(sa.get(p), allow_example=True)]
+    if missing:
+        _check(
+            checks,
+            "sub2api_config",
+            "warn",
+            "sub2api 已启用但配置不完整",
+            missing=missing,
+            blocking=False,
+            action="在配置向导 Downstream 步骤填写 sub2api base_url/token 后重新导出",
+        )
+    else:
+        auto = "自动推送" if sa.get("auto_push", True) else "仅手动推送"
+        _check(checks, "sub2api_config", "ok", f"sub2api 配置已就绪（{auto}）", blocking=False)
+
+
 def _check_team_system(checks: list[dict], req: dict, pay_cfg: dict) -> None:
     mode = _text(req.get("mode")) or "single"
     if mode != "daemon":
@@ -510,6 +544,7 @@ def build_config_health(req: dict | None = None) -> dict:
         _check_payment_config(checks, req, pay_cfg)
         _check_pay_only_inventory(checks, req, pay_cfg)
         _check_cpa(checks, req, pay_cfg)
+        _check_sub2api(checks, req, pay_cfg)
         _check_team_system(checks, req, pay_cfg)
         _check_free_backfill_inventory(checks, req)
 

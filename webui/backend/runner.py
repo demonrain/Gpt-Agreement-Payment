@@ -36,6 +36,19 @@ _otp_pending: bool = False             # set when gopay.py asks/waits for OTP
 _otp_file_is_temp: bool = False
 
 
+def _read_gopay_otp_source() -> str:
+    """读取导出配置中的 gopay.otp.source 值。"""
+    try:
+        cfg = json.loads(s.PAY_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return "auto"
+    gp = cfg.get("gopay") or {}
+    otp = gp.get("otp") or gp.get("otp_provider") or {}
+    if not isinstance(otp, dict):
+        return "auto"
+    return str(otp.get("source") or otp.get("type") or "auto").strip().lower()
+
+
 def _gopay_auto_otp_enabled() -> bool:
     """Return True when config has a non-manual gopay.otp provider.
 
@@ -158,7 +171,10 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
 
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         if gopay:
-            env["WEBUI_GOPAY_OTP_URL"] = wa_relay.otp_url()
+            # adb/appium 有独立 OTP provider，不注入 WebUI relay URL 以免覆盖
+            _otp_src = _read_gopay_otp_source()
+            if _otp_src not in ("adb", "appium"):
+                env["WEBUI_GOPAY_OTP_URL"] = wa_relay.otp_url()
         try:
             proc = subprocess.Popen(
                 cmd,

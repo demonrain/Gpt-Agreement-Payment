@@ -82,6 +82,8 @@ GOPAY_PIN_CLIENT_ID_CHARGE = "47180a8e-f56e-11ed-a05b-0242ac120003-GWC"
 DEFAULT_TIMEOUT = 30
 LINK_RETRY_LIMIT = 2  # 406 "account already linked" retry
 LINK_RETRY_SLEEP_S = 12.0  # Midtrans 需要冷却 ~10s 才会让 406 → 201（实测）
+LINK_429_SLEEP_S = 20.0  # 429 速率限制默认冷却（优先用 Retry-After 头部）
+LINK_429_RETRY_LIMIT = 3  # 429 独立重试上限，不计入 406 预算
 DEFAULT_OTP_REGEX = r"(?<!\d)(\d{6})(?!\d)"
 
 
@@ -133,6 +135,7 @@ class GoPayCharger:
         )
         self.otp_provider = otp_provider
         self.log = log
+        self._gopay_cfg = gopay_cfg
         # Stripe runtime fingerprint (js_checksum / rv_timestamp / version) — these
         # are computed by Stripe.js client-side; replay the captured values from
         # config.runtime or HAR. Without them confirm 400.
@@ -571,7 +574,10 @@ class GoPayCharger:
             "Referer": f"https://app.midtrans.com/snap/v4/redirection/{snap_token}",
         }
         last_err: Optional[str] = None
-        for attempt in range(1, LINK_RETRY_LIMIT + 2):
+        retries_406 = 0
+        retries_429 = 0
+        max_total = LINK_RETRY_LIMIT + LINK_429_RETRY_LIMIT + 1
+        for _ in range(max_total):
             r = self.mt.post(url, json=body, headers=headers, timeout=DEFAULT_TIMEOUT)
             if r.status_code == 201:
                 data = r.json()
@@ -581,7 +587,25 @@ class GoPayCharger:
                 ref = m.group(1)
                 self.log(f"[gopay] midtrans linking ok reference={ref}")
                 return ref
+            if r.status_code == 429:
+                retries_429 += 1
+                if retries_429 > LINK_429_RETRY_LIMIT:
+                    raise GoPayError(f"midtrans linking 429 exhausted {LINK_429_RETRY_LIMIT} retries")
+                wait = LINK_429_SLEEP_S
+                ra = r.headers.get("Retry-After")
+                if ra:
+                    try:
+                        wait = max(float(ra), 5.0)
+                    except (ValueError, TypeError):
+                        pass
+                self.log(f"[gopay] midtrans linking 429 rate-limited, 冷却 {wait}s 再重试 {retries_429}/{LINK_429_RETRY_LIMIT}")
+                last_err = f"429 rate-limited (waited {wait}s)"
+                time.sleep(wait)
+                continue
             if r.status_code == 406:
+                retries_406 += 1
+                if retries_406 > LINK_RETRY_LIMIT:
+                    break
                 try:
                     j = r.json()
                 except Exception:
@@ -592,7 +616,7 @@ class GoPayCharger:
                     last_err = str(j[0])
                 else:
                     last_err = r.text[:120]
-                self.log(f"[gopay] midtrans linking 406 ({last_err}), 冷却 {LINK_RETRY_SLEEP_S}s 再重试 {attempt}/{LINK_RETRY_LIMIT}")
+                self.log(f"[gopay] midtrans linking 406 ({last_err}), 冷却 {LINK_RETRY_SLEEP_S}s 再重试 {retries_406}/{LINK_RETRY_LIMIT}")
                 time.sleep(LINK_RETRY_SLEEP_S)
                 continue
             raise GoPayError(
@@ -839,8 +863,36 @@ class GoPayCharger:
         self._gopay_payment_process(charge_ref, pin_token2)
 
         if cs_id:
-            return self._chatgpt_verify(cs_id)
-        return {"state": "succeeded", "snap_token": snap_token, "charge_ref": charge_ref}
+            result = self._chatgpt_verify(cs_id)
+        else:
+            result = {"state": "succeeded", "snap_token": snap_token, "charge_ref": charge_ref}
+
+        # 支付成功后自动 unlink GoPay → OpenAI（防止下次 406 "already linked"）
+        if result.get("state") == "succeeded":
+            self._try_auto_unlink()
+
+        return result
+
+    def _try_auto_unlink(self) -> None:
+        """best-effort: 如果配置了 auto_unlink 且 OTP source 是 adb，自动 unlink。"""
+        otp_cfg = self._gopay_cfg.get("otp") or self._gopay_cfg.get("otp_provider") or {}
+        if not isinstance(otp_cfg, dict):
+            return
+        otp_source = str(otp_cfg.get("source") or "").strip().lower()
+        auto_unlink = self._gopay_cfg.get("auto_unlink", False)
+        if not auto_unlink or otp_source != "adb":
+            return
+        serial = str(otp_cfg.get("adb_serial") or "emulator-5554")
+        try:
+            from gopay_unlink_adb import gopay_unlink_openai
+            self.log("[gopay] 支付成功，自动 unlink GoPay → OpenAI ...")
+            result = gopay_unlink_openai(serial=serial, log=self.log)
+            if result.get("ok"):
+                self.log(f"[gopay] unlink 完成: {result.get('message', '')}")
+            else:
+                self.log(f"[gopay] unlink 未完全成功: {result.get('message', '')}")
+        except Exception as e:
+            self.log(f"[gopay] unlink 异常（不影响支付结果）: {e}")
 
 
 # ──────────────────────────── OTP providers ───────────────────────
@@ -1222,6 +1274,29 @@ def build_configured_otp_provider(
     json_path = str(otp_cfg.get("json_path") or "")
     slack = _float_cfg(otp_cfg, "issued_after_slack_s", 15.0)
 
+    # adb/appium 显式指定时优先处理，不被 env_url 覆盖
+    if source == "adb":
+        from adb_otp_provider import adb_otp_provider
+        adb_serial = str(otp_cfg.get("adb_serial") or "emulator-5554")
+        return adb_otp_provider(
+            serial=adb_serial,
+            timeout=timeout,
+            interval=interval,
+            log=log,
+        )
+
+    if source == "appium":
+        from appium_otp_provider import appium_otp_provider
+        appium_url = str(otp_cfg.get("appium_url") or "http://127.0.0.1:4723")
+        adb_serial = str(otp_cfg.get("adb_serial") or "")
+        return appium_otp_provider(
+            appium_url=appium_url,
+            serial=adb_serial,
+            timeout=timeout,
+            interval=interval,
+            log=log,
+        )
+
     env_url = os.getenv("WEBUI_GOPAY_OTP_URL", "").strip()
     url = str(otp_cfg.get("url") or otp_cfg.get("relay_url") or env_url or "").strip()
     path = str(
@@ -1271,6 +1346,8 @@ def build_configured_otp_provider(
             )
         if source != "auto":
             raise GoPayError("gopay.otp source=command requires command")
+
+    # adb/appium 已在函数入口提前处理
 
     if source == "auto":
         return fallback_provider

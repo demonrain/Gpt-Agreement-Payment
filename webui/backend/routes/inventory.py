@@ -14,6 +14,7 @@ from ..account_validator import validate_accounts
 from ..db import get_db
 from .. import settings as s
 from .. import runner
+from .. import sub2api_push
 
 
 router = APIRouter(prefix="/api/inventory", tags=["inventory"])
@@ -144,6 +145,62 @@ def cpa_push(req: IdsRequest, user: str = CurrentUser):
     return {"results": results, "summary": summary}
 
 
+def _load_sub2api_cfg() -> dict:
+    try:
+        cfg = json.loads(s.PAY_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"读 PAY_CONFIG_PATH 失败: {e}")
+    sa = cfg.get("sub2api") or {}
+    if not sa.get("enabled"):
+        raise HTTPException(status_code=400,
+                            detail="sub2api 未启用：请先在 wizard Step11 填 base_url + token 并启用")
+    if not (sa.get("base_url") and sa.get("token")):
+        raise HTTPException(status_code=400, detail="sub2api 配置缺 base_url 或 token")
+    return sa
+
+
+def _do_sub2api_push(accounts: list[dict], sub2api_cfg: dict) -> dict:
+    """批量推送账号到 sub2api，记录结果到 pipeline_results。"""
+    result = sub2api_push.push_to_sub2api(accounts, sub2api_cfg)
+    status_str = "ok" if result.get("ok") else f"error: {result.get('error', 'unknown')}"
+    for acc in accounts:
+        email = acc.get("email", "")
+        try:
+            get_db().add_pipeline_result({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "mode": "sub2api_push_manual",
+                "status": "ok" if result.get("ok") else "fail",
+                "registration": {"status": "reused", "email": email},
+                "payment": {"status": "skipped", "email": email},
+                "sub2api_import": status_str,
+            })
+        except Exception:
+            pass
+    return result
+
+
+@router.post("/accounts/sub2api-push")
+def sub2api_push_endpoint(req: IdsRequest, user: str = CurrentUser):
+    """推送选中账号到 sub2api。"""
+    if not req.ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+    if len(req.ids) > 200:
+        raise HTTPException(status_code=400, detail="单次最多 200 个")
+    sa_cfg = _load_sub2api_cfg()
+    db = get_db()
+    accounts = []
+    missing = []
+    for aid in req.ids:
+        acc = db.get_registered_account(int(aid))
+        if not acc:
+            missing.append(aid)
+            continue
+        accounts.append(acc)
+    result = _do_sub2api_push(accounts, sa_cfg)
+    result["missing"] = len(missing)
+    return result
+
+
 @router.post("/accounts/retry-pay")
 def retry_pay(req: RetryPayRequest, user: str = CurrentUser):
     """为指定已注册账号重新触发 pay-only 支付流程。
@@ -163,7 +220,9 @@ def retry_pay(req: RetryPayRequest, user: str = CurrentUser):
         cfg = json.loads(s.PAY_CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"读取支付配置失败: {e}")
-    use_gopay = bool(cfg.get("gopay", {}).get("enabled") or cfg.get("use_gopay"))
+    # GoPay 检测: 配置中有 gopay 块且包含手机号+PIN
+    gp = cfg.get("gopay") or {}
+    use_gopay = bool(gp.get("phone_number") and gp.get("pin"))
     use_paypal = not use_gopay
 
     try:
@@ -177,3 +236,30 @@ def retry_pay(req: RetryPayRequest, user: str = CurrentUser):
         return {"status": "started", "email": email, "runner": result}
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
+
+
+class UnlinkRequest(BaseModel):
+    adb_serial: str = "emulator-5554"
+
+
+@router.post("/gopay-unlink")
+def gopay_unlink(req: UnlinkRequest, user: str = CurrentUser):
+    """手动触发 ADB UI 自动化 Unlink GoPay → OpenAI。"""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    ctf_pay_dir = s.ROOT / "CTF-pay"
+    script = ctf_pay_dir / "gopay_unlink_adb.py"
+    if not script.exists():
+        raise HTTPException(status_code=500, detail="gopay_unlink_adb.py 不存在")
+
+    # 直接 import 执行（与 pipeline 同进程，ADB 命令是 subprocess.run）
+    if str(ctf_pay_dir) not in sys.path:
+        sys.path.insert(0, str(ctf_pay_dir))
+    try:
+        from gopay_unlink_adb import gopay_unlink_openai
+        result = gopay_unlink_openai(serial=req.adb_serial)
+        return result
+    except Exception as e:
+        return {"ok": False, "message": f"unlink 异常: {type(e).__name__}: {str(e)[:300]}"}
