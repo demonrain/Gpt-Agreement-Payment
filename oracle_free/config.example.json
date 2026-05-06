@@ -1,0 +1,29 @@
+{
+  "profile": {
+    "email": "owner@example.com",
+    "first_name": "Ada",
+    "last_name": "Lovelace",
+    "country": "US",
+    "home_region": "us-ashburn-1",
+    "cloud_account_name": "ada-lab",
+    "phone_country_code": "+1",
+    "phone_hint": "5551234567"
+  },
+  "browser": {
+    "headless": false,
+    "slow_mo_ms": 80,
+    "timeout_ms": 90000
+  },
+  "oci": {
+    "region": "us-ashburn-1",
+    "compartment_ocid": "ocid1.tenancy.oc1..replace-with-your-compartment-ocid",
+    "availability_domain": "",
+    "ssh_public_key": "ssh-ed25519 replace-with-your-public-key owner@example.com",
+    "shape": "VM.Standard.A1.Flex",
+    "ocpus": 1,
+    "memory_gbs": 6,
+    "boot_volume_gbs": 50,
+    "create_ipv6": true,
+    "instance_name": "always-free-a1"
+  }
+}

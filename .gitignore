@@ -27,6 +27,8 @@ CTF-pay/config.paypal-*.json
 CTF-reg/config.paypal-proxy.json
 CTF-reg/config.paypal-proxy-*.json
 CTF-reg/config.noproxy.json
+oracle_free/config.local.json
+oracle_free/output/
 
 # pipeline 注册临时 config（运行时产物）
 CTF-pay/pipeline_pay_*.json
