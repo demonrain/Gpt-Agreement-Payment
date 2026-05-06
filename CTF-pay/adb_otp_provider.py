@@ -1,27 +1,8 @@
 """ADB WhatsApp OTP Provider。
 
 通过 ADB 读取 Android 设备/模拟器的 WhatsApp OTP（GoPay 验证码）。
-
-读取策略（按优先级）:
-  1. 通知栏 — dumpsys notification 提取 WhatsApp 通知中的 6 位 OTP
-  2. UI 自动化回退 — 当 WhatsApp 在前台导致无系统通知时，
-     通过 uiautomator dump 直接从聊天界面文本中提取 OTP
-
-轮询前自动按 Home 键，将 WhatsApp 推到后台以确保后续消息产生通知。
-
-前置条件:
-  - Android 设备/模拟器已安装 WhatsApp 并登录
-  - ADB 已连接（`adb devices` 可见设备）
-
-配置示例:
-  "gopay": {
-    "otp": {
-      "source": "adb",
-      "adb_serial": "emulator-5554",
-      "timeout": 300,
-      "interval": 3
-    }
-  }
+策略: 通知栏 dumpsys 优先 → UI 自动化回退。
+前置: 设备已连接、WhatsApp 已安装并登录。
 """
 from __future__ import annotations
 
@@ -208,6 +189,24 @@ def _dismiss_wa_notifications(serial: str) -> None:
 _UI_FALLBACK_AFTER = 5  # 通知栏连续失败 N 次后启用 UI 回退
 
 
+def _verify_device(serial: str, log: Callable[[str], None]) -> bool:
+    """验证 ADB 设备可达，对 IP:PORT 格式自动执行 adb connect。"""
+    if re.match(r"\d+\.\d+\.\d+\.\d+:\d+", serial):
+        try:
+            r = subprocess.run(_adb_cmd("", "connect", serial),
+                               capture_output=True, text=True, timeout=10)
+            if "connected" in r.stdout.lower():
+                log(f"[gopay] ADB: connected to {serial}")
+                return True
+            log(f"[gopay] ADB: connect {serial} → {r.stdout.strip()}")
+        except Exception as e:
+            log(f"[gopay] ADB: connect {serial} failed: {e}")
+    if "adb_ok" in _shell(serial, "echo", "adb_ok", timeout=5):
+        return True
+    log(f"[gopay] ADB: device {serial} unreachable")
+    return False
+
+
 def adb_otp_provider(
     serial: str = "emulator-5554",
     timeout: float = 300.0,
@@ -217,60 +216,65 @@ def adb_otp_provider(
     """工厂函数: 返回一个阻塞式 Callable，轮询 ADB 获取 WhatsApp OTP。
 
     执行流程:
-      1. 按 Home 键将 WhatsApp 推到后台（确保新消息产生通知）
-      2. 轮询 dumpsys notification 读取通知栏
-      3. 如果连续 N 轮读不到，尝试 uiautomator dump 从 WhatsApp 聊天 UI 提取
-      4. 两种策略交替执行直到超时
+      1. 验证设备可达（IP:PORT 格式自动 adb connect）
+      2. 按 Home 键将 WhatsApp 推到后台（确保新消息产生通知）
+      3. 轮询 dumpsys notification 读取通知栏
+      4. 如果连续 N 轮读不到，尝试 uiautomator dump 从 WhatsApp 聊天 UI 提取
+      5. 两种策略交替执行直到超时
     """
 
     def provider() -> str:
         log(f"[gopay] waiting WhatsApp OTP from ADB device: {serial}")
 
-        # 按 Home 键确保 WhatsApp 不在前台，使后续 OTP 产生系统通知
+        if not _verify_device(serial, log):
+            raise RuntimeError(f"ADB device {serial} unreachable, abort OTP polling")
+
         _press_home(serial)
         time.sleep(0.5)
 
-        # 预扫描：通知栏 + UI 聊天界面，把所有旧 OTP 全部标记为"已见"
         seen: set[str] = set()
+        log("[gopay] ADB: pre-scanning notifications...")
         pre_dump = _dump_notifications(serial)
         if pre_dump:
-            pre_otps = _extract_all_wa_otps_from_dump(pre_dump)
-            seen.update(pre_otps)
-        pre_xml = _dump_whatsapp_ui(serial)
-        if pre_xml:
-            for m in _DEFAULT_OTP_RE.finditer(pre_xml):
-                seen.add(m.group(1))
+            seen.update(_extract_all_wa_otps_from_dump(pre_dump))
+        _dismiss_wa_notifications(serial)
         if seen:
-            log(f"[gopay] ADB: skipping {len(seen)} pre-existing OTP(s)")
+            log(f"[gopay] ADB: marked {len(seen)} old OTP(s), cleared notifications")
+        log("[gopay] ADB: polling started")
 
         deadline = time.time() + timeout
         notify_miss = 0
+        ui_baseline_done = False
+        ui_seen: set[str] = set()
 
         while time.time() < deadline:
-            # --- 策略 1: 通知栏 ---
             dump = _dump_notifications(serial)
-            if dump:
-                otp = _extract_wa_otp_from_dump(dump, skip=seen)
-                if otp:
-                    log(f"[gopay] ADB: OTP={otp} (from notification)")
-                    _dismiss_wa_notifications(serial)
-                    return otp
+            otp = _extract_wa_otp_from_dump(dump, skip=seen) if dump else None
+            if otp:
+                log(f"[gopay] ADB: OTP={otp} (from notification)")
+                _dismiss_wa_notifications(serial)
+                return otp
 
             notify_miss += 1
 
-            # --- 策略 2: UI 自动化回退 ---
             if notify_miss >= _UI_FALLBACK_AFTER:
-                if notify_miss == _UI_FALLBACK_AFTER:
-                    log("[gopay] ADB: notification polling failed, switching to UI dump fallback")
                 xml = _dump_whatsapp_ui(serial)
                 if xml:
-                    otp = _extract_otp_from_ui_xml(xml, skip=seen)
-                    if otp:
-                        log(f"[gopay] ADB: OTP={otp} (from UI dump)")
-                        return otp
-                # UI dump 后重置通知计数，交替尝试
-                if notify_miss % _UI_FALLBACK_AFTER == 0:
-                    notify_miss = 0
+                    if not ui_baseline_done:
+                        for m in _DEFAULT_OTP_RE.finditer(xml):
+                            ui_seen.add(m.group(1))
+                        ui_baseline_done = True
+                        log(f"[gopay] ADB: UI baseline captured ({len(ui_seen)} codes)")
+                    else:
+                        all_skip = seen | ui_seen
+                        otp = _extract_otp_from_ui_xml(xml, skip=all_skip)
+                        if otp:
+                            log(f"[gopay] ADB: OTP={otp} (from UI dump)")
+                            return otp
+
+            remaining = int(deadline - time.time())
+            if notify_miss > 0 and notify_miss % 20 == 0:
+                log(f"[gopay] ADB: still waiting OTP... ({remaining}s remaining)")
 
             time.sleep(interval)
 

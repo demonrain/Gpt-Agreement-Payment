@@ -144,4 +144,5 @@ def test_gopay_auto_otp_skips_manual_fifo(tmp_path, monkeypatch):
     }))
     monkeypatch.setattr(runner_mod.s, "PAY_CONFIG_PATH", cfg)
 
-    assert runner_mod._gopay_auto_otp_enabled() is True
+    from webui.backend.runner_helpers import gopay_auto_otp_enabled
+    assert gopay_auto_otp_enabled() is True

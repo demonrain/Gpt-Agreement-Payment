@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from webui.backend.db import get_db
+from error_logger import log_error as _log_error
 
 ROOT = Path(__file__).resolve().parent
 CARDW_DIR = ROOT / "CTF-reg"
@@ -970,34 +971,57 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
             reg = register(effective_cardw, timeout=timeout_reg)
             record["registration"] = {"status": "ok", "email": reg.get("email", "")}
         except RegistrationError as e:
+            _log_error("registration", "", e)
             record["registration"] = {"status": "error", "error": str(e)[:200]}
             record["payment"] = {"status": "skipped"}
             _append_result(record)
             raise
 
-        # Step 2: 支付
+        # Step 2: 支付（带重试，不重新注册）
+        _pay_max_retries = 3
+        _pay_retry_delay = 10
         print(f"\n{'='*60}")
         print(f"[pipeline] Step 2/2: Stripe 支付 ({reg.get('email', '?')})")
         print(f"{'='*60}")
-        try:
-            pay_result = pay(
-                effective_card,
-                session_token=reg.get("session_token"),
-                access_token=reg.get("access_token"),
-                device_id=reg.get("device_id", ""),
-                use_paypal=use_paypal,
-                use_gopay=use_gopay,
-                gopay_otp_file=gopay_otp_file,
-                timeout=timeout_pay,
-            )
-            record["payment"] = {
-                "status": pay_result.get("status", "unknown"),
-                "email": reg.get("email", ""),
-            }
-        except PaymentError as e:
-            record["payment"] = {"status": "error", "email": reg.get("email", ""), "error": str(e)[:200]}
-            _append_result(record)
-            raise
+        pay_result = None
+        for _pay_attempt in range(1, _pay_max_retries + 1):
+            try:
+                pay_result = pay(
+                    effective_card,
+                    session_token=reg.get("session_token"),
+                    access_token=reg.get("access_token"),
+                    device_id=reg.get("device_id", ""),
+                    use_paypal=use_paypal,
+                    use_gopay=use_gopay,
+                    gopay_otp_file=gopay_otp_file,
+                    timeout=timeout_pay,
+                )
+                record["payment"] = {
+                    "status": pay_result.get("status", "unknown"),
+                    "email": reg.get("email", ""),
+                }
+                break
+            except PaymentError as e:
+                _log_error("payment", reg.get("email", ""), e,
+                           extra={"attempt": _pay_attempt, "max": _pay_max_retries})
+                if _pay_attempt < _pay_max_retries:
+                    print(f"[pipeline] 支付失败 (尝试 {_pay_attempt}/{_pay_max_retries}):"
+                          f" {str(e)[:120]}")
+                    try:
+                        _rotate_webshare_ip(card_cfg)
+                        print("[pipeline] 已轮换 Webshare 出口 IP")
+                    except Exception as rot_e:
+                        print(f"[pipeline] IP 轮换跳过: {rot_e}")
+                    print(f"[pipeline] {_pay_retry_delay}s 后重试同一账号...")
+                    time.sleep(_pay_retry_delay)
+                    continue
+                record["payment"] = {
+                    "status": "error",
+                    "email": reg.get("email", ""),
+                    "error": str(e)[:200],
+                }
+                _append_result(record)
+                raise
 
         # Step 3: 支付成功 → gpt-team 导入 + invite 探测
         pay_status = pay_result.get("status", "unknown")
@@ -1427,39 +1451,56 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
         "domain": email.split("@", 1)[1] if "@" in email else "",
         "proxy": "",
     }
-    try:
-        result = pay(
-            card_config_path,
-            session_token=account.get("session_token") if account else None,
-            access_token=account.get("access_token") if account else None,
-            device_id=account.get("device_id", "") if account else None,
-            use_paypal=use_paypal,
-            use_gopay=use_gopay,
-            gopay_otp_file=gopay_otp_file,
-            timeout=timeout_pay,
-        )
-        status = result.get("status", "unknown")
-        raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
-        pay_email = _norm_email(email or raw.get("chatgpt_email") or raw.get("email"))
-        record["payment"] = {"status": status, "email": pay_email}
-        cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
-        if status == "succeeded" and cpa_cfg.get("enabled"):
-            try:
-                sid = raw.get("session_id", "") if isinstance(raw, dict) else ""
-                cpa_status = _cpa_import_after_team(pay_email, sid, cpa_cfg)
-                record["cpa_import"] = cpa_status
-            except Exception as e:
-                print(f"[CPA] 导入异常: {e}")
-                record["cpa_import"] = "error"
-        # sub2api 自动推送（pay-only 路径）
-        reg_for_push = account if account else {"email": pay_email}
-        _sub2api_auto_push(status, record, reg_for_push, card_cfg)
-        _append_result(record)
-        return result
-    except PaymentError as e:
-        record["payment"] = {"status": "error", "email": email, "error": str(e)[:200]}
-        _append_result(record)
-        raise
+    _pay_max_retries = 3
+    _pay_retry_delay = 10
+    for _pay_attempt in range(1, _pay_max_retries + 1):
+        try:
+            result = pay(
+                card_config_path,
+                session_token=account.get("session_token") if account else None,
+                access_token=account.get("access_token") if account else None,
+                device_id=account.get("device_id", "") if account else None,
+                use_paypal=use_paypal,
+                use_gopay=use_gopay,
+                gopay_otp_file=gopay_otp_file,
+                timeout=timeout_pay,
+            )
+            status = result.get("status", "unknown")
+            raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
+            pay_email = _norm_email(email or raw.get("chatgpt_email") or raw.get("email"))
+            record["payment"] = {"status": status, "email": pay_email}
+            cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
+            if status == "succeeded" and cpa_cfg.get("enabled"):
+                try:
+                    sid = raw.get("session_id", "") if isinstance(raw, dict) else ""
+                    cpa_status = _cpa_import_after_team(pay_email, sid, cpa_cfg)
+                    record["cpa_import"] = cpa_status
+                except Exception as e:
+                    print(f"[CPA] 导入异常: {e}")
+                    record["cpa_import"] = "error"
+            reg_for_push = account if account else {"email": pay_email}
+            _sub2api_auto_push(status, record, reg_for_push, card_cfg)
+            _append_result(record)
+            return result
+        except PaymentError as e:
+            _log_error("payment", email, e,
+                       extra={"attempt": _pay_attempt, "max": _pay_max_retries})
+            if _pay_attempt < _pay_max_retries:
+                print(f"[pay-only] 支付失败 (尝试 {_pay_attempt}/{_pay_max_retries}):"
+                      f" {str(e)[:120]}")
+                try:
+                    _rotate_webshare_ip(card_cfg)
+                    print("[pay-only] 已轮换 Webshare 出口 IP")
+                except Exception as rot_e:
+                    print(f"[pay-only] IP 轮换跳过: {rot_e}")
+                print(f"[pay-only] {_pay_retry_delay}s 后重试同一账号...")
+                time.sleep(_pay_retry_delay)
+                continue
+            record["payment"] = {
+                "status": "error", "email": email, "error": str(e)[:200],
+            }
+            _append_result(record)
+            raise
 
 
 # ──────────────────────────────────────────────

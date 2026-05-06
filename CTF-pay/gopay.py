@@ -82,8 +82,8 @@ GOPAY_PIN_CLIENT_ID_CHARGE = "47180a8e-f56e-11ed-a05b-0242ac120003-GWC"
 DEFAULT_TIMEOUT = 30
 LINK_RETRY_LIMIT = 2  # 406 "account already linked" retry
 LINK_RETRY_SLEEP_S = 12.0  # Midtrans 需要冷却 ~10s 才会让 406 → 201（实测）
-LINK_429_SLEEP_S = 20.0  # 429 速率限制固定冷却（优先用 Retry-After 头部）
-LINK_429_RETRY_LIMIT = 20  # 429 独立重试上限，不计入 406 预算
+LINK_429_SLEEP_S = 10.0  # 429 速率限制固定冷却（优先用 Retry-After 头部）
+LINK_429_RETRY_LIMIT = 5  # 429 独立重试上限，超过后交由 pipeline 重新发起支付流程
 DEFAULT_OTP_REGEX = r"(?<!\d)(\d{6})(?!\d)"
 
 

@@ -107,7 +107,8 @@ async def stream(user: str = CurrentUser):
 @router.post("/preview")
 def preview(req: StartRequest, user: str = CurrentUser):
     """干跑：只返命令行不实际启动。"""
-    cmd = runner.build_cmd(
+    from ..runner_helpers import build_cmd
+    cmd = build_cmd(
         req.mode, req.paypal, req.batch, req.workers, req.self_dealer,
         req.register_only, req.pay_only, gopay=req.gopay, count=req.count,
     )
