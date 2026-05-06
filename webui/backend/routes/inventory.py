@@ -5,12 +5,12 @@ import json
 import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..auth import CurrentUser
 from ..account_inventory import build_accounts_inventory
-from ..account_validator import validate_accounts
+from ..account_validator import validate_account_by_id, validate_accounts
 from ..db import get_db
 from .. import settings as s
 from .. import runner
@@ -31,6 +31,7 @@ class RetryPayRequest(BaseModel):
 class CheckRequest(IdsRequest):
     timeout_s: float = 10.0
     max_workers: int = 3
+    proxy_url: str = ""
 
 
 def _load_cpa_cfg() -> dict:
@@ -89,23 +90,49 @@ def get_accounts(user: str = CurrentUser):
 
 @router.post("/accounts/check")
 def check_accounts(req: CheckRequest, user: str = CurrentUser):
-    """Probe each account's session via OpenAI's /api/auth/session.
-    Body: {ids: [account_id, ...], timeout_s?, max_workers?}.
-    Returns per-account {id, email, status, message} (status: valid|invalid|unknown)."""
+    """Probe accounts and stream results via SSE.
+    Body: {ids, timeout_s?, max_workers?, proxy_url?}.
+    SSE events: 'result' per account, then 'summary'."""
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from sse_starlette.sse import EventSourceResponse
+
     if not req.ids:
         raise HTTPException(status_code=400, detail="ids 不能为空")
     if len(req.ids) > 500:
         raise HTTPException(status_code=400, detail="单次最多 500 个")
     workers = max(1, min(int(req.max_workers), 8))
     timeout = max(2.0, min(float(req.timeout_s), 30.0))
-    results = validate_accounts(req.ids, max_workers=workers, timeout_s=timeout)
-    summary = {
-        "total": len(results),
-        "valid": sum(1 for r in results if r.get("status") == "valid"),
-        "invalid": sum(1 for r in results if r.get("status") == "invalid"),
-        "unknown": sum(1 for r in results if r.get("status") == "unknown"),
-    }
-    return {"results": results, "summary": summary}
+    proxy = req.proxy_url.strip() or None
+
+    async def _stream():
+        loop = asyncio.get_event_loop()
+        results = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {
+                ex.submit(validate_account_by_id, int(i),
+                          timeout_s=timeout, proxy_url=proxy): int(i)
+                for i in req.ids
+            }
+            for fut in as_completed(futures):
+                try:
+                    r = fut.result()
+                except Exception as e:
+                    r = {"id": futures[fut], "status": "unknown",
+                         "message": f"worker error: {type(e).__name__}: {e}",
+                         "email": ""}
+                results.append(r)
+                yield {"event": "result", "data": json.dumps(r, ensure_ascii=False)}
+        summary = {
+            "total": len(results),
+            "valid": sum(1 for r in results if r.get("status") == "valid"),
+            "invalid": sum(1 for r in results if r.get("status") == "invalid"),
+            "unknown": sum(1 for r in results if r.get("status") == "unknown"),
+        }
+        yield {"event": "summary", "data": json.dumps(
+            {"results": results, "summary": summary}, ensure_ascii=False)}
+
+    return EventSourceResponse(_stream())
 
 
 @router.post("/accounts/delete")
@@ -157,6 +184,69 @@ def _load_sub2api_cfg() -> dict:
     if not (sa.get("base_url") and sa.get("token")):
         raise HTTPException(status_code=400, detail="sub2api 配置缺 base_url 或 token")
     return sa
+
+
+@router.get("/sub2api-groups")
+def sub2api_groups(
+    platform: str = Query(default="", description="platform filter, e.g. openai"),
+    user: str = CurrentUser,
+):
+    """拉取 sub2api 分组列表（供 Step11 配置下拉选择）。"""
+    import httpx
+
+    sa = _load_sub2api_cfg()
+    base = str(sa.get("base_url") or "").rstrip("/")
+    token = str(sa.get("token") or "")
+
+    # 默认使用 Step11 中配置的 daemon 计数 platform
+    plat = (platform or "").strip() or str(sa.get("count_platform") or "openai").strip() or "openai"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "x-api-key": token,
+        "Accept": "application/json",
+    }
+
+    url = f"{base}/admin/groups/all"
+    url_alt = f"{base}/api/v1/admin/groups/all" if "/api/" not in base else None
+    params = {"platform": plat} if plat else {}
+
+    try:
+        with httpx.Client(timeout=15.0, follow_redirects=True) as c:
+            r = c.get(url, headers=headers, params=params)
+            if "text/html" in r.headers.get("content-type", "") and url_alt:
+                r = c.get(url_alt, headers=headers, params=params)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"sub2api 连接失败: {e}")
+
+    if r.status_code in (401, 403):
+        raise HTTPException(status_code=502, detail=f"sub2api 鉴权失败 HTTP {r.status_code}")
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"sub2api 拉取分组失败 HTTP {r.status_code}")
+
+    try:
+        data = r.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="sub2api 分组响应非 JSON")
+
+    # 兼容不同封装：{code:0,data:[...]} / {data:[...]} / [...]
+    if isinstance(data, dict) and data.get("code") == 0 and "data" in data:
+        data = data.get("data")
+    if isinstance(data, dict) and "data" in data and isinstance(data.get("data"), list):
+        data = data.get("data")
+
+    groups = data if isinstance(data, list) else []
+    out = []
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        out.append({
+            "id": g.get("id"),
+            "name": g.get("name") or "",
+            "platform": g.get("platform") or plat,
+            "status": g.get("status") or "",
+        })
+    return {"ok": True, "platform": plat, "groups": out}
 
 
 def _do_sub2api_push(accounts: list[dict], sub2api_cfg: dict) -> dict:

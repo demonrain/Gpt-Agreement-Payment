@@ -24,12 +24,15 @@ so source IP stays close to the original registration IP.
 """
 from __future__ import annotations
 
+import logging
 import socket
 from typing import Iterable, Optional
 
 import httpx
 
 from .db import get_db
+
+log = logging.getLogger(__name__)
 
 
 _USER_AGENT = (
@@ -51,7 +54,11 @@ def _gost_alive(port: int = 18898) -> bool:
 
 
 def _client(timeout: float, proxy: Optional[str]) -> httpx.Client:
-    return httpx.Client(timeout=timeout, follow_redirects=False, proxy=proxy)
+    try:
+        return httpx.Client(timeout=timeout, follow_redirects=False, proxy=proxy)
+    except ImportError:
+        # socksio 未安装时回退到直连
+        return httpx.Client(timeout=timeout, follow_redirects=False)
 
 
 def _probe_refresh(refresh_token: str, timeout: float,
@@ -171,8 +178,57 @@ def _probe_me_with_cookie(account: dict, timeout: float,
     return "unknown", f"cookie/me: http {r.status_code}"
 
 
+_PROXY_FAIL_KEYWORDS = ("ProxyError", "ImportError", "socksio")
+
+
+def _run_probes(account: dict, timeout_s: float,
+                proxy: Optional[str]) -> tuple[str, str]:
+    """Execute probe chain with a given proxy setting."""
+    refresh_token = (account.get("refresh_token") or "").strip()
+    access_token = (account.get("access_token") or "").strip()
+    cookie = _build_cookie(account)
+
+    # ── probe 1: refresh_token (most reliable, long-lived)
+    if refresh_token:
+        s, m = _probe_refresh(refresh_token, timeout_s, proxy)
+        if s != "unknown":
+            return s, m
+
+    # ── probe 2: access_token Bearer → /me
+    if access_token:
+        s, m = _probe_me_with_bearer(access_token, timeout_s, proxy)
+        if s == "valid":
+            return s, m
+        if s == "invalid":
+            if not refresh_token:
+                return "invalid", m
+
+    # ── probe 3: cookie / session_token → /me (CF-pruned, conservative)
+    if cookie:
+        s, m = _probe_me_with_cookie(account, timeout_s, proxy)
+        if s == "valid":
+            return s, m
+        if s == "invalid" and not (access_token or refresh_token):
+            return "invalid", m
+        if s == "invalid":
+            return "unknown", f"cookie says invalid but other creds inconclusive: {m}"
+        return s, m
+
+    return "unknown", "no probe path succeeded"
+
+
+def _resolve_proxy(proxy_url: Optional[str]) -> Optional[str]:
+    """Determine proxy to use: explicit URL > auto-detect gost > None."""
+    if proxy_url:
+        return proxy_url.strip()
+    if _gost_alive():
+        return "socks5://127.0.0.1:18898"
+    return None
+
+
 def validate_account(account: dict, *, timeout_s: float = 10.0,
-                       use_proxy: bool = True) -> tuple[str, str]:
+                       use_proxy: bool = True,
+                       proxy_url: Optional[str] = None) -> tuple[str, str]:
     """Pure HTTP probe — caller persists result.
 
     Returns (status, message) where status ∈ {'valid','invalid','unknown'}.
@@ -183,45 +239,23 @@ def validate_account(account: dict, *, timeout_s: float = 10.0,
     if not (refresh_token or access_token or cookie):
         return "unknown", "no credentials stored"
 
-    proxy = "socks5://127.0.0.1:18898" if use_proxy and _gost_alive() else None
+    proxy = _resolve_proxy(proxy_url) if use_proxy else None
 
-    # ── probe 1: refresh_token (most reliable, long-lived)
-    if refresh_token:
-        s, m = _probe_refresh(refresh_token, timeout_s, proxy)
-        if s != "unknown":
-            return s, m
-        # rt path uncertain: fall through to at/cookie
+    s, m = _run_probes(account, timeout_s, proxy)
 
-    # ── probe 2: access_token Bearer → /me
-    if access_token:
-        s, m = _probe_me_with_bearer(access_token, timeout_s, proxy)
-        if s == "valid":
-            return s, m
-        if s == "invalid":
-            # at expired/revoked. Without rt there's no path to mint a new one
-            # → genuinely unusable. With rt we'd already have returned above.
-            if not refresh_token:
-                return "invalid", m
-            # If we had an rt but it returned 'unknown' earlier, falling
-            # through to cookie probe is still informative.
+    # 代理故障时自动回退直连重试
+    if s == "unknown" and proxy and any(k in m for k in _PROXY_FAIL_KEYWORDS):
+        s2, m2 = _run_probes(account, timeout_s, None)
+        if s2 != "unknown":
+            return s2, f"{m2} (direct fallback, proxy failed)"
+        return "unknown", f"{m} → direct retry: {m2}"
 
-    # ── probe 3: cookie / session_token → /me (CF-pruned, conservative)
-    if cookie:
-        s, m = _probe_me_with_cookie(account, timeout_s, proxy)
-        if s == "valid":
-            return s, m
-        # cookie 401 alone isn't strong enough to delete; degrade to unknown
-        if s == "invalid" and not (access_token or refresh_token):
-            return "invalid", m
-        if s == "invalid":
-            return "unknown", f"cookie says invalid but other creds inconclusive: {m}"
-        return s, m
-
-    return "unknown", "no probe path succeeded"
+    return s, m
 
 
 def validate_account_by_id(account_id: int, *, timeout_s: float = 10.0,
-                              use_proxy: bool = True) -> dict:
+                              use_proxy: bool = True,
+                              proxy_url: Optional[str] = None) -> dict:
     """Validate one stored account, persist outcome, return summary."""
     db = get_db()
     account = db.get_registered_account(int(account_id))
@@ -229,18 +263,22 @@ def validate_account_by_id(account_id: int, *, timeout_s: float = 10.0,
         return {"id": int(account_id), "status": "missing",
                 "message": "account not found", "email": ""}
     status, message = validate_account(account, timeout_s=timeout_s,
-                                          use_proxy=use_proxy)
+                                          use_proxy=use_proxy,
+                                          proxy_url=proxy_url)
+    email = account.get("email", "")
+    log.info("[validate] id=%s email=%s → %s: %s", account_id, email, status, message)
     db.update_account_check(int(account_id), status, message)
     return {
         "id": int(account_id),
-        "email": account.get("email", ""),
+        "email": email,
         "status": status,
         "message": message,
     }
 
 
 def validate_accounts(account_ids: Iterable[int], *, max_workers: int = 3,
-                        timeout_s: float = 10.0, use_proxy: bool = True) -> list[dict]:
+                        timeout_s: float = 10.0, use_proxy: bool = True,
+                        proxy_url: Optional[str] = None) -> list[dict]:
     """Validate many accounts with bounded concurrency."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     ids = [int(i) for i in account_ids if str(i).strip().lstrip("-").isdigit()]
@@ -250,7 +288,8 @@ def validate_accounts(account_ids: Iterable[int], *, max_workers: int = 3,
     workers = max(1, min(int(max_workers), len(ids)))
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(validate_account_by_id, i,
-                              timeout_s=timeout_s, use_proxy=use_proxy): i
+                              timeout_s=timeout_s, use_proxy=use_proxy,
+                              proxy_url=proxy_url): i
                    for i in ids}
         for fut in as_completed(futures):
             try:

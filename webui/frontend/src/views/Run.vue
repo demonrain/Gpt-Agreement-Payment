@@ -156,6 +156,10 @@
             <input type="checkbox" :checked="allSelected" @change="toggleSelectAll" />
             <span>全选 ({{ selectedIds.size }} / {{ inventory.accounts.length }})</span>
           </label>
+          <div class="inventory-proxy-row">
+            <label class="inventory-proxy-label">验证代理</label>
+            <input v-model="checkProxy" class="inventory-proxy-input" placeholder="留空自动检测 gost · 示例 socks5://host:port 或 http://host:port" />
+          </div>
           <div class="inventory-toolbar-actions">
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="selectedIds.size === 0" @click="verifySelected">验证选中</TermBtn>
             <TermBtn variant="ghost" :loading="inventoryBusy" :disabled="unknownOrUncheckedIds.length === 0" @click="verifyAllUnknown">验证全部未检 ({{ unknownOrUncheckedIds.length }})</TermBtn>
@@ -180,11 +184,16 @@
               </span>
               <span class="badge" :class="payBadgeClass(acc.pay_state)">{{ payStateLabel(acc) }}</span>
               <span class="badge" :class="rtBadgeClass(acc.rt_state)">{{ rtStateLabel(acc) }}</span>
-              <span class="badge" :class="cpaBadgeClass(acc)" :title="acc.cpa_status">{{ cpaLabel(acc) }}</span>
-              <span class="badge" :class="sub2apiBadgeClass(acc)" :title="acc.sub2api_status">{{ sub2apiLabel(acc) }}</span>
-              <button v-if="acc.pay_only_eligible" class="inventory-row-action retry-pay-btn" :disabled="inventoryBusy || status.running" @click="retryPay(acc)">继续开通</button>
-              <button v-if="!acc.cpa_pushed" class="inventory-row-action" :disabled="inventoryBusy" @click="pushOneToCpa(acc.id)">推送→CPA</button>
-              <button v-if="!acc.sub2api_pushed" class="inventory-row-action sub2api-btn" :disabled="inventoryBusy" @click="pushOneToSub2api(acc.id)">推送→sub2api</button>
+              <div v-if="hasRowActions(acc)" class="row-actions-wrap">
+                <button class="row-actions-trigger" @click="toggleRowMenu(acc.id)">操作 ▾</button>
+                <div v-if="openMenuId === acc.id" class="row-actions-menu">
+                  <button v-if="acc.pay_only_eligible" :disabled="inventoryBusy || status.running" @click="retryPay(acc); openMenuId = 0">继续开通</button>
+                  <button v-if="!acc.cpa_pushed" :disabled="inventoryBusy" @click="pushOneToCpa(acc.id); openMenuId = 0">推送→CPA</button>
+                  <button v-if="!acc.sub2api_pushed" :disabled="inventoryBusy" @click="pushOneToSub2api(acc.id); openMenuId = 0">推送→sub2api</button>
+                </div>
+              </div>
+              <span v-if="acc.cpa_pushed" class="badge badge-ok" :title="acc.cpa_status">CPA✓</span>
+              <span v-if="acc.sub2api_pushed" class="badge badge-ok" :title="acc.sub2api_status">sub2api✓</span>
             </div>
             <div class="inventory-row-sub">
               <span>注册 {{ formatInventoryTs(acc.registered_at) }}</span>
@@ -417,6 +426,7 @@ const inventoryBusy = ref(false);
 const autoScroll = ref(true);
 const inventoryLoading = ref(false);
 const inventoryError = ref("");
+const checkProxy = ref("");
 const streamEl = ref<HTMLElement | null>(null);
 const clock = ref("");
 let clockTimer: ReturnType<typeof setInterval> | undefined;
@@ -554,6 +564,11 @@ function checkBadgeClass(s: InventoryAccount["last_check_status"]) {
   if (s === "unknown") return "badge-warn";
   return "badge-ghost";
 }
+const openMenuId = ref(0);
+function toggleRowMenu(id: number) { openMenuId.value = openMenuId.value === id ? 0 : id; }
+function hasRowActions(acc: InventoryAccount) {
+  return acc.pay_only_eligible || !acc.cpa_pushed || !acc.sub2api_pushed;
+}
 function isSelected(id: number) { return selectedIds.value.has(id); }
 function toggleSelect(id: number) {
   const next = new Set(selectedIds.value);
@@ -580,17 +595,74 @@ const unknownOrUncheckedIds = computed(() =>
     .map(a => a.id)
 );
 
+let _logSeq = 100000;
+function pushLog(text: string) {
+  lines.value.push({ seq: _logSeq++, ts: Date.now() / 1000, line: text });
+  if (lines.value.length > 5000) lines.value.splice(0, 1000);
+  if (autoScroll.value) {
+    nextTick(() => { if (streamEl.value) streamEl.value.scrollTop = streamEl.value.scrollHeight; });
+  }
+}
+
 async function runCheck(ids: number[], label: string) {
   if (!ids.length) { message.warning(`没有可${label}的账号`); return; }
   inventoryBusy.value = true;
   ids.forEach(id => checkingIds.value.add(id));
+  pushLog(`[验证] 开始 ${label}，共 ${ids.length} 个账号${checkProxy.value ? `，代理: ${checkProxy.value}` : ""}`);
+  const BASE = import.meta.env.BASE_URL || "/";
+  const body = JSON.stringify({ ids, proxy_url: checkProxy.value || "" });
   try {
-    const r = await api.post("/inventory/accounts/check", { ids });
-    const s = r.data?.summary || {};
-    message.success(`${label}完成：valid=${s.valid || 0}  invalid=${s.invalid || 0}  unknown=${s.unknown || 0}`);
+    const resp = await fetch(BASE + "api/inventory/accounts/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body,
+    });
+    if (!resp.ok) {
+      const detail = await resp.text();
+      pushLog(`[验证] ${label}失败：${detail}`);
+      message.error(`${label}失败`);
+      return;
+    }
+    const reader = resp.body?.getReader();
+    if (!reader) { message.error("浏览器不支持流式读取"); return; }
+    const decoder = new TextDecoder();
+    let buf = "";
+    let summary: any = null;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const chunks = buf.split("\n");
+      buf = chunks.pop() || "";
+      let eventType = "";
+      for (const chunk of chunks) {
+        if (chunk.startsWith("event:")) {
+          eventType = chunk.slice(6).trim();
+        } else if (chunk.startsWith("data:")) {
+          const raw = chunk.slice(5).trim();
+          if (!raw) continue;
+          try {
+            const data = JSON.parse(raw);
+            if (eventType === "result") {
+              const icon = data.status === "valid" ? "✓" : data.status === "invalid" ? "✗" : "？";
+              pushLog(`[验证] ${icon} ${data.email || `id=${data.id}`} → ${data.status}: ${data.message}`);
+              checkingIds.value.delete(data.id);
+            } else if (eventType === "summary") {
+              summary = data.summary;
+            }
+          } catch { /* ignore */ }
+        }
+      }
+    }
+    if (summary) {
+      pushLog(`[验证] ${label}完成：valid=${summary.valid || 0}  invalid=${summary.invalid || 0}  unknown=${summary.unknown || 0}`);
+      message.success(`${label}完成：valid=${summary.valid || 0}  invalid=${summary.invalid || 0}  unknown=${summary.unknown || 0}`);
+    }
     await refreshInventory();
   } catch (e: any) {
-    message.error(`${label}失败：${e?.response?.data?.detail || e?.message || e}`);
+    pushLog(`[验证] ${label}失败：${e?.message || e}`);
+    message.error(`${label}失败：${e?.message || e}`);
   } finally {
     ids.forEach(id => checkingIds.value.delete(id));
     inventoryBusy.value = false;
@@ -1137,11 +1209,78 @@ onBeforeUnmount(() => {
   user-select: none;
 }
 .inventory-toolbar-check input { accent-color: var(--accent); }
+.inventory-proxy-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 2px;
+}
+.inventory-proxy-label {
+  font-size: 11px;
+  color: var(--fg-secondary);
+  white-space: nowrap;
+}
+.inventory-proxy-input {
+  flex: 1;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  color: var(--fg-primary);
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 3px;
+  max-width: 480px;
+}
+.inventory-proxy-input::placeholder { color: var(--fg-tertiary); }
 .inventory-toolbar-actions {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
 }
+.row-actions-wrap {
+  position: relative;
+  display: inline-block;
+}
+.row-actions-trigger {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  color: var(--fg-secondary);
+  font: inherit;
+  font-size: 10px;
+  padding: 1px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.row-actions-trigger:hover { color: var(--fg-primary); border-color: var(--accent); }
+.row-actions-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 20;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  padding: 4px 0;
+  min-width: 120px;
+  white-space: nowrap;
+}
+.row-actions-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--fg-primary);
+  font: inherit;
+  font-size: 11px;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+.row-actions-menu button:hover { background: var(--accent); color: #000; }
+.row-actions-menu button:disabled { opacity: 0.4; cursor: not-allowed; }
+.row-actions-menu button:disabled:hover { background: none; color: var(--fg-primary); }
 .inventory-list {
   display: flex;
   flex-direction: column;

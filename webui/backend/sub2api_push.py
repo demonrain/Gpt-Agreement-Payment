@@ -105,6 +105,8 @@ def push_to_sub2api(
     base_url = str(sub2api_cfg.get("base_url") or "").rstrip("/")
     token = str(sub2api_cfg.get("token") or "")
     skip_bind = sub2api_cfg.get("skip_default_group_bind", True)
+    push_group_id_raw = str(sub2api_cfg.get("push_group_id") or "").strip()
+    push_group_id = int(push_group_id_raw) if push_group_id_raw.isdigit() else 0
 
     if not base_url or not token:
         return {"error": "sub2api 配置缺少 base_url 或 token"}
@@ -134,6 +136,11 @@ def push_to_sub2api(
         url_with_prefix = f"{base_url}/api/v1/admin/accounts/data"
     else:
         url_with_prefix = None
+    # 其他 admin 端点
+    accounts_url = f"{base_url}/admin/accounts"
+    accounts_url_with_prefix = f"{base_url}/api/v1/admin/accounts" if ("/api/" not in base_url) else None
+    bulk_update_url = f"{base_url}/admin/accounts/bulk-update"
+    bulk_update_url_with_prefix = f"{base_url}/api/v1/admin/accounts/bulk-update" if ("/api/" not in base_url) else None
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
@@ -153,6 +160,72 @@ def push_to_sub2api(
             if "text/html" in ct and url_with_prefix:
                 log(f"[sub2api] 收到 HTML 响应，尝试带 /api/v1 前缀: {url_with_prefix}")
                 r = client.post(url_with_prefix, json=body, headers=headers)
+            # 推送成功后：如果配置了 push_group_id，则对导入的账号做一次批量分组绑定
+            if r.status_code < 300 and push_group_id > 0:
+                # 通过 email/name 搜索拿到 sub2api account_id
+                account_ids: list[int] = []
+                for item in sub_accounts:
+                    key = (item.get("extra") or {}).get("email") or item.get("name") or ""
+                    key = str(key).strip()
+                    if not key:
+                        continue
+                    rr = client.get(
+                        accounts_url,
+                        headers=headers,
+                        params={"page": 1, "page_size": 5, "search": key},
+                    )
+                    if "text/html" in rr.headers.get("content-type", "") and accounts_url_with_prefix:
+                        rr = client.get(
+                            accounts_url_with_prefix,
+                            headers=headers,
+                            params={"page": 1, "page_size": 5, "search": key},
+                        )
+                    if rr.status_code >= 400:
+                        continue
+                    try:
+                        d = rr.json()
+                    except Exception:
+                        continue
+                    if isinstance(d, dict) and d.get("code") == 0 and "data" in d:
+                        d = d.get("data")
+                    # 兼容 items/data/results
+                    items = None
+                    if isinstance(d, dict):
+                        if isinstance(d.get("items"), list):
+                            items = d.get("items")
+                        elif isinstance(d.get("data"), list):
+                            items = d.get("data")
+                        elif isinstance(d.get("results"), list):
+                            items = d.get("results")
+                    if items is None and isinstance(d, list):
+                        items = d
+                    if not items:
+                        continue
+                    first = items[0] if isinstance(items[0], dict) else None
+                    if not first:
+                        continue
+                    try:
+                        aid = int(first.get("id") or 0)
+                    except Exception:
+                        aid = 0
+                    if aid > 0:
+                        account_ids.append(aid)
+
+                if account_ids:
+                    log(f"[sub2api] 批量绑定分组 group_id={push_group_id}  accounts={len(account_ids)}")
+                    rr = client.post(
+                        bulk_update_url,
+                        headers=headers,
+                        json={"account_ids": account_ids, "group_ids": [push_group_id]},
+                    )
+                    if "text/html" in rr.headers.get("content-type", "") and bulk_update_url_with_prefix:
+                        rr = client.post(
+                            bulk_update_url_with_prefix,
+                            headers=headers,
+                            json={"account_ids": account_ids, "group_ids": [push_group_id]},
+                        )
+                    if rr.status_code >= 400:
+                        log(f"[sub2api] ⚠ 分组绑定失败 HTTP {rr.status_code} body[:200]={rr.text[:200]}")
         log(f"[sub2api] HTTP {r.status_code}  content-type={r.headers.get('content-type', '?')}  body[:{min(200, len(r.text))}]={r.text[:200]}")
         if r.status_code >= 400:
             detail = ""
@@ -170,6 +243,7 @@ def push_to_sub2api(
                 "account_failed": 0,
                 "pushed": len(sub_accounts),
                 "skipped": skipped,
+                "push_group_id": push_group_id,
                 "raw_status": r.status_code,
                 "note": "服务器返回空 body，视为成功",
             }
@@ -203,6 +277,7 @@ def push_to_sub2api(
             "proxy_failed": data.get("proxy_failed", 0),
             "pushed": len(sub_accounts),
             "skipped": skipped,
+            "push_group_id": push_group_id,
         }
     except Exception as e:
         return {"error": f"请求失败: {type(e).__name__}: {str(e)[:200]}"}

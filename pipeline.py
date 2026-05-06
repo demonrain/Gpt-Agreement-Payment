@@ -553,6 +553,70 @@ class TeamSystemClient:
             return json.loads(r.read().decode())
 
 
+class Sub2apiClient:
+    """sub2api 客户端：查询 OpenAI 且 active 的可用账号数量。"""
+
+    def __init__(self, base_url, token, timeout_s=30):
+        import urllib.request
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.timeout_s = timeout_s
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),  # 显式清空代理
+        )
+
+    def _list_accounts(self, platform: str = "openai", status: str = "active", group: str = "") -> dict:
+        import urllib.request
+        import urllib.parse
+        params = {"page": 1, "page_size": 1, "platform": platform}
+        if status:
+            params["status"] = status
+        if group:
+            params["group"] = group
+        query = urllib.parse.urlencode(params)
+        base_path = "/admin/accounts"
+        paths = [f"{self.base_url}{base_path}"]
+        if "/api/" not in self.base_url:
+            paths.append(f"{self.base_url}/api/v1{base_path}")
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "x-api-key": self.token,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        last_err = None
+        for p in paths:
+            try:
+                req = urllib.request.Request(f"{p}?{query}", headers=headers, method="GET")
+                with self._opener.open(req, timeout=self.timeout_s) as resp:
+                    body = resp.read().decode()
+                    data = json.loads(body)
+                if isinstance(data, dict) and data.get("code") == 0 and isinstance(data.get("data"), dict):
+                    data = data["data"]
+                if isinstance(data, dict):
+                    return data
+                raise RuntimeError(f"sub2api 响应非 JSON 对象: {type(data).__name__}")
+            except Exception as e:
+                last_err = e
+        raise RuntimeError(f"sub2api 账号查询失败: {last_err}")
+
+    def count_usable_accounts(self, platform: str = "openai", status: str = "active", group: str = "") -> dict:
+        data = self._list_accounts(platform=platform, status=status, group=group)
+        total = data.get("total", 0) if isinstance(data, dict) else 0
+        try:
+            usable = int(total or 0)
+        except Exception:
+            usable = 0
+        return {
+            "source": "sub2api",
+            "platform": platform,
+            "status": status,
+            "group": group,
+            "usable": usable,
+            "total": usable,
+        }
+
+
 # ──────────────────────────────────────────────
 # 1. 注册模块
 # ──────────────────────────────────────────────
@@ -1781,16 +1845,21 @@ def _cleanup_dead_cf_subdomains(provisioner, gpt_team_db_path: str,
     return stats
 
 
-def daemon(card_config_path, cardw_config_path=None, use_paypal=False):
+def daemon(card_config_path, cardw_config_path=None, use_paypal=False,
+           use_gopay=False, gopay_otp_file=None):
     """
-    状态机：常驻维护 gpt-team 系统里 '可用邀请' 账号数 ≥ target_ok_accounts。
-    - 可用定义：isOpen & !isBanned & !isDisabled & !noInvitePermission & seat 未满
+    状态机：常驻维护已启用下游系统里的可用账号数均 ≥ target_ok_accounts。
+    - gpt-team 可用定义：!isBanned & !isDisabled & !noInvitePermission & !expired & seat 未满
+    - sub2api 可用定义：platform=openai & status=active（服务端过滤）
     - 限流：每小时 / 每日上限（避免短时间批量触发风控）
     - 保护：连续失败 ≥ max_consecutive_failures 时冷却 consecutive_fail_cooldown_s
+    - 两次尝试最小间隔 min_interval_between_runs_s（GoPay 付款冷却等）
     - 状态持久化：SQLite runtime_meta[daemon_state]
     - 优雅退出：SIGINT/SIGTERM 完成当前循环后停止
     """
     import signal
+    if use_paypal and use_gopay:
+        raise RuntimeError("daemon: --paypal 与 --gopay 互斥，请勿同时启用")
     card_cfg = _read_card_cfg(card_config_path)
     cardw_path = _load_cardw_path_from_card_cfg(card_cfg, cardw_config_path)
 
@@ -1807,15 +1876,22 @@ def daemon(card_config_path, cardw_config_path=None, use_paypal=False):
     # gpt-team 的 batch-import 默认把新账号放入 "recovery" 补号池（is_open=0 + account_usage='recovery'），
     # 对外售卖时 admin 手动改 sales 并开启。daemon 默认维护补号池数量。
     usage_pool = str(d_cfg.get("usage_pool", "recovery")).lower()
+    min_interval_s = int(d_cfg.get("min_interval_between_runs_s", 0) or 0)
 
     ts_cfg = card_cfg.get("team_system") or {}
     cd_h = int(ts_cfg.get("domain_cooldown_hours", 24))
     pool = _build_domain_pool_from_cardw(cardw_path, cd_h)
     team_client = _build_team_client_from_card_cfg(card_cfg)
+    sub2api_client, sa_platform, sa_status, sa_group = _build_sub2api_client_from_card_cfg(card_cfg)
     _proxy_pool = _build_proxy_pool_from_card_cfg(card_cfg)  # 预留，暂不参与 pipeline 分发
 
-    if not team_client:
-        raise RuntimeError("daemon 需要 team_system.enabled=true")
+    counters = []
+    if sub2api_client:
+        counters.append(("sub2api", sub2api_client))
+    if team_client:
+        counters.append(("gpt-team", team_client))
+    if not counters:
+        raise RuntimeError("daemon 需要至少一个下游启用（sub2api.enabled 或 team_system.enabled）")
 
     stop = {"flag": False}
     def _sig(*_a):
@@ -1835,10 +1911,15 @@ def daemon(card_config_path, cardw_config_path=None, use_paypal=False):
     if ws_enabled and ws_cfg.get("api_key"):
         try:
             _ws_q = WebshareClient(ws_cfg["api_key"]).get_replacement_quota()
-            print(f"[Webshare] 启动时额度：available={_ws_q['available']}/{_ws_q['total']}  "
-                  f"threshold={ws_threshold} no_perm 触发轮换；无额度时连续 {ws_threshold} no_perm 冷却 {ws_cooldown_s/3600:.1f}h")
-            if _ws_q["available"] <= 0:
-                print(f"[Webshare] ⚠ 无剩余替换次数，本次启动将禁用自动轮换（走冷却回退）")
+            if _ws_q.get("total", 0) == 0:
+                print(f"[Webshare] Rotating 计划（无替换额度概念），"
+                      f"每次新连接自动分配不同 IP")
+            else:
+                print(f"[Webshare] 启动时额度：available={_ws_q['available']}/{_ws_q['total']}  "
+                      f"threshold={ws_threshold} no_perm 触发轮换；"
+                      f"无额度时连续 {ws_threshold} no_perm 冷却 {ws_cooldown_s/3600:.1f}h")
+                if _ws_q["available"] <= 0:
+                    print(f"[Webshare] ⚠ 无剩余替换次数，本次启动将禁用自动轮换（走冷却回退）")
         except Exception as e:
             print(f"[Webshare] 启动额度查询失败（不影响运行）: {e}")
 
@@ -1914,10 +1995,26 @@ def daemon(card_config_path, cardw_config_path=None, use_paypal=False):
 
     _hour_label = f"{rate_per_hour}/h" if rate_per_hour > 0 else "无限"
     _day_label = f"{rate_per_day}/d" if rate_per_day > 0 else "无限"
-    print(f"[daemon] 启动：pool={usage_pool}  target={target}  poll={poll_s}s  rate={_hour_label}, {_day_label}  seat_limit={seat_limit}")
+    _min_lbl = f"{min_interval_s}s" if min_interval_s > 0 else "关闭"
+    _pay = "gopay" if use_gopay else ("paypal" if use_paypal else "card")
+    _downs_parts = []
+    for n, _ in counters:
+        if n == "sub2api":
+            gg = sa_group or "-"
+            _downs_parts.append(f"sub2api({sa_platform}/{sa_status}/group={gg})")
+        else:
+            _downs_parts.append(n)
+    _downs = ",".join(_downs_parts)
+    print(f"[daemon] 启动：pay={_pay}  pool={usage_pool}  target={target}  poll={poll_s}s  "
+          f"rate={_hour_label}, {_day_label}  min_interval={_min_lbl}  seat_limit={seat_limit}  "
+          f"downstreams={_downs}")
     print(f"[daemon] 历史累计: attempts={state['total_attempts']} ok={state['total_succeeded']} fail={state['total_failed']}")
 
-    kwargs = {"card_cfg": card_cfg, "pool": pool, "team_client": team_client, "use_paypal": use_paypal}
+    kwargs = {
+        "card_cfg": card_cfg, "pool": pool, "team_client": team_client,
+        "use_paypal": use_paypal, "use_gopay": use_gopay,
+        "gopay_otp_file": gopay_otp_file,
+    }
 
     while not stop["flag"]:
         # 无 Webshare 轮换额度 + 连续 no_perm 触发的冷却闸门
@@ -1935,9 +2032,15 @@ def daemon(card_config_path, cardw_config_path=None, use_paypal=False):
 
         state["last_check_iso"] = datetime.now(timezone.utc).isoformat()
         try:
-            stats = team_client.count_usable_accounts(seat_limit=seat_limit, usage=usage_pool)
-            state["last_stats"] = stats
-            usable = stats["usable"]
+            down_stats = {}
+            for name, client in counters:
+                if name == "sub2api":
+                    stats = client.count_usable_accounts(platform=sa_platform, status=sa_status, group=sa_group)
+                else:
+                    stats = client.count_usable_accounts(seat_limit=seat_limit, usage=usage_pool)
+                down_stats[name] = stats
+            state["last_stats"] = down_stats
+            usable = min(int((s or {}).get("usable", 0) or 0) for s in down_stats.values())
         except Exception as e:
             print(f"[daemon] 查账号数异常: {e}")
             state["last_error"] = f"count: {e}"
@@ -1947,10 +2050,23 @@ def daemon(card_config_path, cardw_config_path=None, use_paypal=False):
                 time.sleep(1)
             continue
 
-        print(f"[daemon] {state['last_check_iso']}  {usage_pool} 池可用 {usable}/{target}  "
-              f"(total={stats['total_active']} full={stats['full']} "
-              f"no_perm={stats['no_invite_permission']} banned/dis={stats['banned_or_disabled']} "
-              f"expired={stats['expired']})")
+        details = []
+        for name, stats in state["last_stats"].items():
+            if name == "gpt-team":
+                details.append(
+                    f"gpt-team {usage_pool}={stats.get('usable', 0)}/{target}"
+                    f"(total={stats.get('total_active', 0)} full={stats.get('full', 0)} "
+                    f"no_perm={stats.get('no_invite_permission', 0)} "
+                    f"banned/dis={stats.get('banned_or_disabled', 0)} expired={stats.get('expired', 0)})"
+                )
+            else:
+                grp = stats.get('group', '')
+                st = stats.get('status', 'active')
+                label = f"sub2api {stats.get('platform', 'openai')}/{st}"
+                if grp:
+                    label += f"/{grp}"
+                details.append(f"{label}={stats.get('usable', 0)}/{target}")
+        print(f"[daemon] {state['last_check_iso']}  min_usable={usable}/{target}  {' | '.join(details)}")
 
         if usable >= target:
             _save()
@@ -2152,6 +2268,18 @@ def daemon(card_config_path, cardw_config_path=None, use_paypal=False):
                 print(f"[daemon] zone 切换完成。池中移除 {removed} 个旧 zone 子域；"
                       f"累计 zone 轮换={state['total_zone_rotations']}")
 
+        # 两次 pipeline 最小间隔（GoPay 付款冷却、侧向限流）
+        if min_interval_s > 0:
+            elapsed = time.time() - run_ts
+            remaining = min_interval_s - elapsed
+            if remaining > 0:
+                print(f"[daemon] 最小间隔 {min_interval_s}s，本轮已过 {elapsed:.0f}s，"
+                      f"再等待 {remaining:.0f}s …")
+                for _ in range(int(remaining)):
+                    if stop["flag"]:
+                        break
+                    time.sleep(1)
+
         _save()
         # 每轮 pipeline 后清一次 30min 前的孤儿，防 /tmp 被 SIGKILL 残留吃爆
         _cleanup_temp_leftovers(max_age_s=1800, verbose=False)
@@ -2240,9 +2368,59 @@ def _build_team_client_from_card_cfg(card_cfg):
     )
 
 
+def _build_sub2api_client_from_card_cfg(card_cfg):
+    """构建 Sub2apiClient；同时返回 daemon 计数用的 platform/status 参数。"""
+    sa = card_cfg.get("sub2api") or {}
+    if not sa.get("enabled"):
+        return None, "openai", "active", ""
+    base_url = str(sa.get("base_url", "")).strip()
+    token = str(sa.get("token", "")).strip()
+    if not base_url or not token:
+        return None, "openai", "active", ""
+    platform = str(sa.get("count_platform", "openai")).strip() or "openai"
+    status = str(sa.get("count_status", "active")).strip() or "active"
+    group = str(sa.get("count_group", "")).strip()
+    client = Sub2apiClient(
+        base_url=base_url,
+        token=token,
+        timeout_s=int(sa.get("timeout_s", 30)),
+    )
+    return client, platform, status, group
+
+
 # ──────────────────────────────────────────────
 # 代理池（预留，目前不参与 pipeline，等填入 proxies.list 后接管）
 # ──────────────────────────────────────────────
+
+_CLASH_PORTS = (7897, 7890, 7891)
+
+
+def _resolve_outbound_proxy() -> str:
+    """解析系统代理：优先环境变量，WSL 下回退探测宿主 Clash"""
+    import socket as _sock
+    env = (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+           or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy"))
+    if env:
+        return env
+    if not os.environ.get("WSL_DISTRO_NAME"):
+        return ""
+    try:
+        with open("/proc/net/route") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3 and parts[1] == "00000000":
+                    h = parts[2]
+                    host = ".".join(str(int(h[i:i + 2], 16)) for i in (6, 4, 2, 0))
+                    for port in _CLASH_PORTS:
+                        try:
+                            s = _sock.create_connection((host, port), timeout=1)
+                            s.close()
+                            return f"http://{host}:{port}"
+                        except OSError:
+                            continue
+    except OSError:
+        pass
+    return ""
 
 
 class WebshareQuotaExhausted(RuntimeError):
@@ -2259,9 +2437,11 @@ class WebshareClient:
         import urllib.request
         self.api_key = api_key.strip()
         self.timeout_s = timeout_s
-        self._opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}),
+        proxy = _resolve_outbound_proxy()
+        handler = urllib.request.ProxyHandler(
+            {"http": proxy, "https": proxy} if proxy else {}
         )
+        self._opener = urllib.request.build_opener(handler)
 
     def _req(self, path: str, method: str = "GET", body: dict = None):
         import urllib.request
@@ -2316,11 +2496,28 @@ class WebshareClient:
                 raise WebshareQuotaExhausted(f"http={e.code} body={body_text}") from e
             raise RuntimeError(f"Webshare refresh HTTP {e.code}: {body_text}") from e
 
+    def _list_proxies(self, extra_qs: str = "") -> list[dict]:
+        """先 backbone 再 direct，返回 proxy list"""
+        import urllib.error
+        for mode in ("backbone", "direct"):
+            qs = f"mode={mode}&page=1&page_size=5"
+            if extra_qs:
+                qs += f"&{extra_qs}"
+            try:
+                with self._req(f"/proxy/list/?{qs}") as r:
+                    data = json.loads(r.read().decode())
+                results = data.get("results") or []
+                if results:
+                    return results
+            except urllib.error.HTTPError as e:
+                if e.code == 400:
+                    continue
+                raise
+        return []
+
     def get_current_proxy(self) -> dict:
-        """GET /proxy/list/ 返回第一个 proxy。未校验 valid。"""
-        with self._req("/proxy/list/?mode=direct&page=1&page_size=5") as r:
-            data = json.loads(r.read().decode())
-        results = data.get("results") or []
+        """返回第一个 proxy。未校验 valid。"""
+        results = self._list_proxies()
         if not results:
             raise RuntimeError("Webshare 代理列表为空")
         return results[0]
@@ -2328,13 +2525,10 @@ class WebshareClient:
     def get_proxy_by_country(self, country_code: str) -> dict | None:
         """获取指定国家的第一个有效代理。无匹配时返回 None。"""
         cc = _normalize_country(country_code)
-        with self._req(f"/proxy/list/?mode=direct&page=1&page_size=5&country_code__in={cc}") as r:
-            data = json.loads(r.read().decode())
-        for p in (data.get("results") or []):
+        results = self._list_proxies(extra_qs=f"country_code__in={cc}")
+        for p in results:
             if p.get("valid"):
                 return p
-        # 无有效代理则返回第一个（可能 valid=False 但仍可尝试）
-        results = data.get("results") or []
         return results[0] if results else None
 
     def wait_for_fresh_proxy(self, prev_ip: str = "", max_wait_s: int = 120,
@@ -2393,7 +2587,13 @@ def _swap_gost_relay(new_ip: str, new_port: int, username: str, password: str,
         time.sleep(0.3)
 
     upstream = f"{upstream_scheme}://{username}:{password}@{new_ip}:{new_port}"
-    cmd = ["gost", f"-L=socks5://:{listen_port}", f"-F={upstream}"]
+    http_port = listen_port + 1
+    cmd = ["gost", f"-L=socks5://:{listen_port}", f"-L=http://:{http_port}"]
+    local_proxy = _resolve_outbound_proxy()
+    if local_proxy:
+        cmd.append(f"-F={local_proxy}")
+        print(f"[gost] WSL 链式代理：先过 {local_proxy}")
+    cmd.append(f"-F={upstream}")
     log_path = f"/tmp/gost-{listen_port}.log"
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
@@ -2473,21 +2673,26 @@ def _ensure_gost_alive(card_cfg: dict, team_client=None) -> bool:
         print(f"[gost] 查询 Webshare IP 失败: {e}")
         return False
     upstream_scheme = str(ws_cfg.get("gost_upstream_scheme", "http"))
+    proxy_host = px.get("proxy_address") or "p.webshare.io"
+    proxy_port = int(px.get("port") or 80)
+    if not px.get("proxy_address"):
+        proxy_port = 80
     try:
-        _swap_gost_relay(px["proxy_address"], int(px["port"]),
+        _swap_gost_relay(proxy_host, proxy_port,
                           px["username"], px["password"],
                           listen_port=listen_port,
                           upstream_scheme=upstream_scheme)
     except Exception as e:
         print(f"[gost] 拉起失败: {e}")
         return False
-    print(f"[gost] 代理国家={px.get('country_code', '?')} IP={px['proxy_address']}")
+    print(f"[gost] 代理国家={px.get('country_code', '?')} "
+          f"upstream={proxy_host}:{proxy_port}")
     # 同步 team 全局代理
     if team_client and ws_cfg.get("sync_team_proxy", True):
         team_scheme = str(ws_cfg.get("team_proxy_scheme", "socks5"))
         try:
             team_client.update_global_proxy(
-                f"{team_scheme}://{px['username']}:{px['password']}@{px['proxy_address']}:{px['port']}"
+                f"{team_scheme}://{px['username']}:{px['password']}@{proxy_host}:{proxy_port}"
             )
         except Exception as e:
             print(f"[gost] team 代理同步失败: {e}")
@@ -2509,35 +2714,43 @@ def _rotate_webshare_ip(card_cfg: dict, team_client=None, prev_ip: str = "") -> 
     poll_wait = int(ws_cfg.get("poll_timeout_s", 120))
 
     client = WebshareClient(api_key)
+    is_rotating = False
     try:
         quota = client.get_replacement_quota()
         print(f"[Webshare] 替换额度：available={quota['available']}/{quota['total']} used={quota['used']}")
-        if quota["available"] <= 0:
+        is_rotating = quota.get("total", 0) == 0
+        if not is_rotating and quota["available"] <= 0:
             raise WebshareQuotaExhausted(f"quota: {quota}")
     except WebshareQuotaExhausted:
         raise
     except Exception as e:
-        print(f"[Webshare] 查询额度异常（继续 refresh）: {e}")
+        print(f"[Webshare] 查询额度异常（继续）: {e}")
 
     lock_country = _normalize_country(str(ws_cfg.get("lock_country", "")))
-    if lock_country:
-        print(f"[Webshare] refresh pool，锁国家={lock_country}（prev_ip={prev_ip or '?'}）")
+    if is_rotating:
+        print(f"[Webshare] Rotating 计划，跳过 refresh，重启 gost 获取新连接")
+        new_px = client.get_current_proxy()
     else:
-        print(f"[Webshare] refresh pool（prev_ip={prev_ip or '?'}）")
-    client.refresh_pool(country=lock_country)
-    new_px = client.wait_for_fresh_proxy(prev_ip=prev_ip, max_wait_s=poll_wait)
-    new_ip = new_px["proxy_address"]
-    new_port = int(new_px["port"])
+        if lock_country:
+            print(f"[Webshare] refresh pool，锁国家={lock_country}（prev_ip={prev_ip or '?'}）")
+        else:
+            print(f"[Webshare] refresh pool（prev_ip={prev_ip or '?'}）")
+        client.refresh_pool(country=lock_country)
+        new_px = client.wait_for_fresh_proxy(prev_ip=prev_ip, max_wait_s=poll_wait)
+    new_host = new_px.get("proxy_address") or "p.webshare.io"
+    new_port = int(new_px.get("port") or 80)
+    if not new_px.get("proxy_address"):
+        new_port = 80
     user = new_px["username"]
     pw = new_px["password"]
-    print(f"[Webshare] 新 IP: {new_ip}:{new_port}  "
+    print(f"[Webshare] 新代理: {new_host}:{new_port}  "
           f"{new_px.get('country_code')}/{new_px.get('asn_name')}  valid={new_px.get('valid')}")
 
-    _swap_gost_relay(new_ip, new_port, user, pw,
+    _swap_gost_relay(new_host, new_port, user, pw,
                       listen_port=listen_port, upstream_scheme=upstream_scheme)
 
     if sync_team and team_client:
-        team_url = f"{team_scheme}://{user}:{pw}@{new_ip}:{new_port}"
+        team_url = f"{team_scheme}://{user}:{pw}@{new_host}:{new_port}"
         try:
             r = team_client.update_global_proxy(team_url)
             print(f"[Team] 全局代理已更新 → {r.get('proxyUrl', team_url)}")
@@ -3501,7 +3714,13 @@ def main():
             free_backfill_rt_loop(args.config, cardw_config_path=args.cardw_config)
             return
         if args.daemon:
-            daemon(args.config, cardw_config_path=args.cardw_config, use_paypal=args.paypal)
+            daemon(
+                args.config,
+                cardw_config_path=args.cardw_config,
+                use_paypal=args.paypal,
+                use_gopay=args.gopay,
+                gopay_otp_file=args.gopay_otp_file,
+            )
             return
         if args.self_dealer > 0:
             self_dealer(args.config, cardw_config_path=args.cardw_config,

@@ -28,6 +28,22 @@
         </p>
       </div>
 
+      <div class="info-block" style="border-left-color: var(--fg-tertiary)">
+        <p><strong>如何获取 API Key</strong></p>
+        <ol class="info-list">
+          <li>登录 <a href="https://dashboard.webshare.io" target="_blank" rel="noopener">dashboard.webshare.io</a></li>
+          <li>进入 <a href="https://dashboard.webshare.io/userapi/keys" target="_blank" rel="noopener">API Keys</a> 页面</li>
+          <li>复制已有的 Key，或点击 Create API Key 创建新的</li>
+        </ol>
+        <p style="margin-top:6px"><strong>API 使用方式</strong>（backbone 模式，适用住宅/数据中心代理）</p>
+        <ul class="info-list">
+          <li>代理地址: <code>p.webshare.io</code></li>
+          <li>端口: <code>80</code> / <code>1080</code> / <code>3128</code>（用户名密码认证）</li>
+          <li>认证: 用户名 + 密码（从 API 返回的 proxy 对象获取）</li>
+          <li>API 文档: <a href="https://apidocs.webshare.io/proxy-list/list" target="_blank" rel="noopener">apidocs.webshare.io</a></li>
+        </ul>
+      </div>
+
       <div class="form-stack">
         <TermField v-model="form.api_key" label="Webshare API Key · api_key" type="password" />
         <TermField v-model="form.lock_country" label="锁出口国 · lock_country" placeholder="US (锁出口国)" />

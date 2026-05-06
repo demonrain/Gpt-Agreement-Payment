@@ -162,12 +162,24 @@ def _apply_proxy_to_http_session(session_obj, proxy_url: str):
         return
 
     if proxy_url:
-        normalized_proxy = proxy_url
-        if _HAS_CURL_CFFI and proxy_url.startswith("socks5://"):
-            normalized_proxy = "socks5h://" + proxy_url[len("socks5://"):]
+        normalized_proxy = _derive_proxy_for_session(session_obj, proxy_url)
         session_obj.proxies = {"http": normalized_proxy, "https": normalized_proxy}
     else:
         session_obj.proxies = {"http": "", "https": ""}
+
+
+def _derive_proxy_for_session(session_obj, proxy_url: str) -> str:
+    """curl_cffi SOCKS5 在链式代理下 TLS 握手失败；
+    改用 gost 同端口组的 HTTP 代理（listen_port+1）"""
+    from urllib.parse import urlparse
+    is_cffi = _HAS_CURL_CFFI and type(session_obj).__module__.startswith("curl_cffi")
+    pp = urlparse(proxy_url)
+    if pp.scheme in ("socks5", "socks5h") and is_cffi:
+        http_port = (pp.port or 18898) + 1
+        return f"http://{pp.hostname}:{http_port}"
+    if proxy_url.startswith("socks5://") and is_cffi:
+        return "socks5h://" + proxy_url[len("socks5://"):]
+    return proxy_url
 
 
 _PROXY_OVERRIDE_SENTINEL = object()

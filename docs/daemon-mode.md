@@ -40,7 +40,9 @@ loop:
     if rate_limit 卡了:
         continue
 
-    usable = 查 gpt-team DB（!isBanned && !isDisabled && !noInvitePermission && !expired && seat 未满）
+    usable = min(各下游可用数)
+    # sub2api: GET /admin/accounts?platform=<count_platform>&status=<count_status>&group=<count_group>
+    # gpt-team: 遍历 DB，过滤 !isBanned & !isDisabled & !noInvitePermission & !expired & 席位未满
 
     if usable >= target_ok_accounts:
         continue   # 满了，下一轮再看
@@ -65,9 +67,9 @@ loop:
 |---|---|---|
 | **DataDome 滑块** | `[B-DDC]` / `[B6]` iframe 出现 slider DOM | Playwright 用 `smoothstep` 缓动 + 随机抖动模拟人类拖 |
 | **PayPal 预填邮箱** | 邮箱步骤 `<input disabled value="...">` | 跳过填写，直接点 Next 进密码步骤 |
-| **连续 `no_invite_permission`** | `webshare.refresh_threshold`（默认 2） | Webshare API 换 IP → 切 gost upstream → 同步下游代理 |
+| **连续 `no_invite_permission`** | `webshare.refresh_threshold`（默认 2） | Static 计划: Webshare API refresh 换 IP → 切 gost upstream → 同步下游代理；Rotating 计划: 重启 gost 获取新连接（自动分配新 IP） |
 | **zone 内 IP 轮换耗尽** | `zone_rotate_after_ip_rotations`（默认 2） | 切 active CF zone，下次 provision 走另一个 zone |
-| **Webshare 配额耗尽** | HTTP 402 / 429 | 标 `webshare_rotation_disabled`，进 `no_rotation_cooldown_s`（默认 3h）冷却 |
+| **Webshare 配额耗尽** | HTTP 402 / 429（仅 Static 计划） | 标 `webshare_rotation_disabled`，进 `no_rotation_cooldown_s`（默认 3h）冷却；Rotating 计划自动跳过（无配额概念） |
 | **`invite=ok` 自愈** | 一次成功的注册 | 清 `ip_no_perm_streak` + `zone_ip_rotations` + `webshare_rotation_disabled` |
 | **`/tmp` 孤儿清理** | daemon 启动 + 每轮 pipeline 跑完 | 回收 30 分钟以上的 `chatgpt_reg_*` Camoufox profile / `xvfb-run.*` 目录 |
 | **CF DNS 配额（Free 200/zone）** | 每 `cf_cleanup_every_n_runs` 轮（默认 30） | 拿 `gpt-team` DB 跟 CF 当前记录 diff，删 banned/disabled/expired/孤儿记录 |
@@ -103,15 +105,30 @@ def _try_solve_ddc_slider(page):
 
 ### 2. Webshare API 自动换 IP
 
+自动检测计划类型（Static vs Rotating Residential），执行不同策略：
+
 ```python
 def _rotate_webshare_ip():
-    # 1. 调 Webshare API 换一个新代理
-    new_proxy = webshare.refresh_pool(country="US")
+    quota = client.get_replacement_quota()
+    is_rotating = (quota.total == 0)
 
-    # 2. 杀掉本地 gost，新起一个指向新 upstream
-    _swap_gost_relay(port=18898, upstream=new_proxy)
+    if is_rotating:
+        # Rotating 计划: 无需 refresh API，重启 gost 即获新 IP
+        new_proxy = client.get_current_proxy()
+    else:
+        # Static 计划: 调 refresh API 换一个新代理
+        client.refresh_pool(country="US")
+        new_proxy = client.wait_for_fresh_proxy(prev_ip)
 
-    # 3. 同步 gpt-team 全局代理设置
+    # backbone 模式: proxy_address 为 null 时使用 p.webshare.io:80
+    host = new_proxy.proxy_address or "p.webshare.io"
+    port = new_proxy.port or 80
+
+    # 杀掉本地 gost，新起一个; WSL 下自动链式代理 (Clash → Webshare)
+    # gost 同时开 SOCKS5(:18898) + HTTP(:18899) 双端口
+    _swap_gost_relay(port=18898, upstream=f"{host}:{port}")
+
+    # 同步 gpt-team 全局代理设置
     if cfg.webshare.sync_team_proxy:
         team_system.update_global_proxy(new_proxy)
 ```
@@ -187,12 +204,19 @@ gost 偶尔会自己挂（OOM / 网络异常）。daemon 启动时 + 每轮 pipe
 ```python
 def _ensure_gost_alive(port=18898):
     if not is_port_listening(port):
-        # 重新从 Webshare 拉一个代理
-        proxy = webshare.refresh_pool()
-        _swap_gost_relay(port, proxy)
+        proxy = client.get_current_proxy()
+        # backbone 模式: proxy_address=null → 自动使用 p.webshare.io:80
+        host = proxy.proxy_address or "p.webshare.io"
+        # WSL: 自动插入链式代理 (Clash → Webshare)
+        # 双端口: SOCKS5(:18898) + HTTP(:18899)
+        _swap_gost_relay(port, host)
         if cfg.webshare.sync_team_proxy:
             team_system.update_global_proxy(proxy)
 ```
+
+**WSL 链式代理**：WSL 下 gost 无法直连外网，`_swap_gost_relay()` 自动检测 Windows 宿主的 Clash 代理（7897/7890/7891 端口），形成 `gost → Clash → Webshare` 链。
+
+**双端口监听**：gost 同时开 SOCKS5(`:18898`) 和 HTTP(`:18899`)。Playwright/浏览器用 SOCKS5，curl_cffi 用 HTTP 端口（避免 SOCKS5 链式代理的 TLS 握手问题）。
 
 ### 7. RegistrationError 分类
 
@@ -254,9 +278,19 @@ CPA host 在 CF 后面时用 `curl_cffi` 而不是 `requests`，绕 CF WAF。
   "zone_ip_rotations": 0,
   "total_zone_rotations": 2,
   "last_stats": {
-    "total_active": 44,
-    "usable": 38,
-    "no_invite_permission": 5
+    "gpt-team": {
+      "total_active": 44,
+      "usable": 38,
+      "no_invite_permission": 5
+    },
+    "sub2api": {
+      "source": "sub2api",
+      "platform": "openai",
+      "status": "active",
+      "group": "group1",
+      "usable": 42,
+      "total": 42
+    }
   }
 }
 ```

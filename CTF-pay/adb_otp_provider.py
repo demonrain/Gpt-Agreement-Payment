@@ -230,14 +230,18 @@ def adb_otp_provider(
         _press_home(serial)
         time.sleep(0.5)
 
-        # 预扫描：把当前已有的旧 OTP 全部标记为"已见"，避免误读旧通知
+        # 预扫描：通知栏 + UI 聊天界面，把所有旧 OTP 全部标记为"已见"
         seen: set[str] = set()
         pre_dump = _dump_notifications(serial)
         if pre_dump:
             pre_otps = _extract_all_wa_otps_from_dump(pre_dump)
-            if pre_otps:
-                seen.update(pre_otps)
-                log(f"[gopay] ADB: skipping {len(pre_otps)} pre-existing OTP(s): {pre_otps}")
+            seen.update(pre_otps)
+        pre_xml = _dump_whatsapp_ui(serial)
+        if pre_xml:
+            for m in _DEFAULT_OTP_RE.finditer(pre_xml):
+                seen.add(m.group(1))
+        if seen:
+            log(f"[gopay] ADB: skipping {len(seen)} pre-existing OTP(s)")
 
         deadline = time.time() + timeout
         notify_miss = 0

@@ -76,6 +76,7 @@ cp CTF-reg/config.example.json              CTF-reg/config.noproxy.json
   "lock_country": "US",
   "zone_rotate_after_ip_rotations": 2,
   "gost_listen_port": 18898,
+  "gost_upstream_scheme": "http",
   "sync_team_proxy": true
 }
 ```
@@ -87,8 +88,13 @@ cp CTF-reg/config.example.json              CTF-reg/config.noproxy.json
 | `no_rotation_cooldown_s` | 配额耗尽后的冷却时长 |
 | `lock_country` | 锁国（US 比较稳） |
 | `zone_rotate_after_ip_rotations` | 同 zone 内换几次 IP 后切 zone |
-| `gost_listen_port` | 本地 gost 中继监听的端口 |
+| `gost_listen_port` | 本地 gost 中继 SOCKS5 端口（HTTP 端口自动为 +1，即默认 18899） |
+| `gost_upstream_scheme` | gost 上游协议（默认 `http`） |
 | `sync_team_proxy` | 换 IP 后是否同步 gpt-team 全局代理设置 |
+
+> **Rotating Residential 计划**：`total` 替换额度为 0 时自动识别为 Rotating 计划，跳过 `refresh_pool()` API 调用，重启 gost 获取新连接即可。`proxy_address` 为 null 时自动使用 `p.webshare.io:80` 作为 backbone 上游。
+>
+> **WSL 环境**：gost 自动检测 Windows 宿主 Clash 代理（7897/7890/7891 端口），形成链式代理 `gost → Clash → Webshare`。双端口监听：SOCKS5 供浏览器使用，HTTP 供 curl_cffi 使用（避免 SOCKS5 链式 TLS 问题）。
 
 ### `cpa` —— 推下游 CPA 服务器（可选）
 
@@ -104,6 +110,33 @@ cp CTF-reg/config.example.json              CTF-reg/config.noproxy.json
 ```
 
 `oauth_client_id` 是 Codex CLI 的 OAuth client_id —— 从 Codex CLI 源码可以看到具体值。
+
+### `sub2api` —— 推下游 sub2api 服务器（可选）
+
+```json
+"sub2api": {
+  "enabled": true,
+  "base_url": "https://your-sub2api.example.com",
+  "token": "YOUR_ADMIN_TOKEN",
+  "auto_push": true,
+  "skip_default_group_bind": true,
+  "count_platform": "openai",
+  "count_status": "active",
+  "count_group": "",
+  "push_group_id": ""
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `base_url` | sub2api 服务地址 |
+| `token` | 管理员 Token（JWT 或 Admin API Key） |
+| `auto_push` | 支付成功后自动推送 |
+| `skip_default_group_bind` | 跳过 sub2api 默认分组绑定 |
+| `count_platform` | daemon 计数用的平台过滤（openai/anthropic/gemini/antigravity） |
+| `count_status` | daemon 计数用的状态过滤（active/inactive/error 或空） |
+| `count_group` | daemon 计数用的分组过滤（空=全部 / ungrouped / 具体 group_id） |
+| `push_group_id` | 推送成功后批量绑定到的目标分组 ID |
 
 ### `proxies` —— 全局代理池
 

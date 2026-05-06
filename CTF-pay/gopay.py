@@ -82,8 +82,8 @@ GOPAY_PIN_CLIENT_ID_CHARGE = "47180a8e-f56e-11ed-a05b-0242ac120003-GWC"
 DEFAULT_TIMEOUT = 30
 LINK_RETRY_LIMIT = 2  # 406 "account already linked" retry
 LINK_RETRY_SLEEP_S = 12.0  # Midtrans 需要冷却 ~10s 才会让 406 → 201（实测）
-LINK_429_SLEEP_S = 20.0  # 429 速率限制默认冷却（优先用 Retry-After 头部）
-LINK_429_RETRY_LIMIT = 3  # 429 独立重试上限，不计入 406 预算
+LINK_429_SLEEP_S = 20.0  # 429 速率限制固定冷却（优先用 Retry-After 头部）
+LINK_429_RETRY_LIMIT = 20  # 429 独立重试上限，不计入 406 预算
 DEFAULT_OTP_REGEX = r"(?<!\d)(\d{6})(?!\d)"
 
 
@@ -158,11 +158,25 @@ class GoPayCharger:
                 self.cs.proxies = _px
             except Exception:
                 pass
+            # curl_cffi SOCKS5 在链式代理下 TLS 握手可能失败；
+            # 优先使用 gost 同端口组的 HTTP 代理（listen_port+1）
+            ext_proxy = self._derive_http_proxy(proxy)
+            ext_px = {"http": ext_proxy, "https": ext_proxy}
             try:
-                self.ext.proxies = _px
+                self.ext.proxies = ext_px
             except Exception:
                 pass
             self.mt.proxies = _px
+
+    @staticmethod
+    def _derive_http_proxy(socks_url: str) -> str:
+        """socks5(h)://host:port → http://host:{port+1}（gost HTTP 端口）"""
+        from urllib.parse import urlparse as _up
+        pp = _up(socks_url)
+        if pp.scheme not in ("socks5", "socks5h"):
+            return socks_url
+        http_port = (pp.port or 18898) + 1
+        return f"http://{pp.hostname}:{http_port}"
 
     # ───── Step 1-4: ChatGPT/Stripe checkout ─────
 

@@ -483,24 +483,45 @@ def _check_team_system(checks: list[dict], req: dict, pay_cfg: dict) -> None:
     mode = _text(req.get("mode")) or "single"
     if mode != "daemon":
         return
+
+    # daemon 需要至少一个下游启用（sub2api 或 team_system）
+    sa = pay_cfg.get("sub2api") if isinstance(pay_cfg.get("sub2api"), dict) else {}
+    sub2api_ok = bool(sa.get("enabled") and sa.get("base_url") and sa.get("token"))
+
     ts = pay_cfg.get("team_system") if isinstance(pay_cfg.get("team_system"), dict) else {}
-    missing = []
-    if not ts.get("enabled"):
-        missing.append("team_system.enabled")
-    for key in ("base_url", "username", "password"):
-        if _is_missing(ts.get(key), allow_example=True):
-            missing.append(f"team_system.{key}")
-    if missing:
+    ts_enabled = bool(ts.get("enabled"))
+    ts_missing = []
+    if ts_enabled:
+        for key in ("base_url", "username", "password"):
+            if _is_missing(ts.get(key), allow_example=True):
+                ts_missing.append(f"team_system.{key}")
+
+    if not sub2api_ok and not ts_enabled:
+        _check(
+            checks,
+            "daemon_downstream",
+            "fail",
+            "daemon 需要至少一个下游启用（sub2api 或 team_system）",
+            missing=["sub2api.enabled 或 team_system.enabled"],
+            action="在配置向导 Step 11 下游推送中启用 sub2api 或 gpt-team 后重新导出配置",
+        )
+    elif ts_enabled and ts_missing:
         _check(
             checks,
             "team_system",
             "fail",
-            "daemon 需要 team_system 配置",
-            missing=missing,
+            "team_system 已启用但配置不完整",
+            missing=ts_missing,
             action="在配置向导 Team System 步骤补齐后重新导出配置",
         )
     else:
-        _check(checks, "team_system", "ok", "team_system 配置已配置", blocking=False)
+        parts = []
+        if sub2api_ok:
+            parts.append("sub2api")
+        if ts_enabled and not ts_missing:
+            parts.append("gpt-team")
+        _check(checks, "daemon_downstream", "ok",
+               f"daemon 下游已就绪（{', '.join(parts)}）", blocking=False)
 
 
 def _check_free_backfill_inventory(checks: list[dict], req: dict) -> None:

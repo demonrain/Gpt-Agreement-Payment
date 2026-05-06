@@ -26,6 +26,58 @@ def _payment_method(answers: dict) -> str:
     return (answers.get("payment") or {}).get("method", "both")
 
 
+def _daemon_from_wizard(da: dict | None) -> dict:
+    """将向导扁平字段转为 pay JSON 的 daemon 段（与 pipeline.daemon 读取一致）。"""
+    if not da or not isinstance(da, dict):
+        return {}
+    out: dict = {}
+
+    def _int_key(k: str) -> int | None:
+        if k not in da or da[k] is None or da[k] == "":
+            return None
+        try:
+            return int(da[k])
+        except (TypeError, ValueError):
+            return None
+
+    for k in (
+        "target_ok_accounts",
+        "poll_interval_s",
+        "max_consecutive_failures",
+        "seat_limit",
+        "consecutive_fail_cooldown_s",
+        "min_interval_between_runs_s",
+        "cf_cleanup_every_n_runs",
+    ):
+        v = _int_key(k)
+        if v is not None:
+            out[k] = v
+
+    if da.get("usage_pool") not in (None, ""):
+        out["usage_pool"] = str(da["usage_pool"]).strip().lower()
+
+    if da.get("gpt_team_db_path") not in (None, ""):
+        out["gpt_team_db_path"] = str(da["gpt_team_db_path"]).strip()
+
+    rl: dict = {}
+    ph = _int_key("rate_limit_per_hour")
+    if ph is not None:
+        rl["per_hour"] = ph
+    pd = _int_key("rate_limit_per_day")
+    if pd is not None:
+        rl["per_day"] = pd
+    if rl:
+        out["rate_limit"] = rl
+
+    jmin = _int_key("jitter_min")
+    jmax = _int_key("jitter_max")
+    if jmin is not None and jmax is not None:
+        lo, hi = (jmin, jmax) if jmin <= jmax else (jmax, jmin)
+        out["jitter_before_run_s"] = [lo, hi]
+
+    return out
+
+
 def _project_pay(answers: dict) -> dict:
     """Map flat wizard answers onto CTF-pay config schema."""
     out: dict = {}
@@ -97,9 +149,14 @@ def _project_pay(answers: dict) -> dict:
             sub_block["token"] = str(sa["token"])
         sub_block["auto_push"] = bool(sa.get("auto_push", True))
         sub_block["skip_default_group_bind"] = bool(sa.get("skip_default_group_bind", True))
+        sub_block["count_platform"] = str(sa.get("count_platform", "openai")).strip() or "openai"
+        sub_block["count_status"] = str(sa.get("count_status", "active")).strip()
+        sub_block["count_group"] = str(sa.get("count_group", "")).strip()
+        if sa.get("push_group_id"):
+            sub_block["push_group_id"] = str(sa["push_group_id"])
         out["sub2api"] = sub_block
     if "daemon" in answers:
-        out["daemon"] = answers["daemon"]
+        out["daemon"] = _daemon_from_wizard(answers.get("daemon"))
     if "stripe_runtime" in answers and pm in ("card", "both"):
         out["runtime"] = answers["stripe_runtime"]
     if "card" in answers and pm in ("card", "both"):
