@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import socket as _sock
 import subprocess
 from pathlib import Path
 from ._common import CheckResult, PreflightResult, aggregate
@@ -39,11 +40,18 @@ def _detect_host_ip() -> str | None:
 
 _HOST_IP = _detect_host_ip()
 
-# MuMu 模拟器常见默认端口（使用检测到的宿主机 IP 或 127.0.0.1）
+# 各模拟器常见 ADB 端口（使用检测到的宿主机 IP 或 127.0.0.1）
 _H = _HOST_IP or "127.0.0.1"
+# MuMu 12 实例端口规则: 16384 + 32 * instance_index
+_MUMU12_INSTANCE_PORTS = [16384 + 32 * i for i in range(4)]
 KNOWN_EMULATOR_PORTS = {
-    "mumu": f"{_H}:7555",
-    "mumu12": f"{_H}:16384",
+    "mumu6": f"{_H}:7555",
+    "mumu12_0": f"{_H}:16384",
+    "mumu12_1": f"{_H}:16416",
+    "mumu12_2": f"{_H}:16448",
+    "mumu12_3": f"{_H}:16480",
+    "mumu12_adb0": f"{_H}:5555",
+    "mumu12_adb1": f"{_H}:5557",
     "ldplayer": "emulator-5554",
     "nox": f"{_H}:62001",
     "bluestacks": f"{_H}:5555",
@@ -192,36 +200,69 @@ def check(body: dict) -> PreflightResult:
     return aggregate(checks)
 
 
-def list_devices() -> dict:
-    """列出所有 ADB 设备及其状态。"""
-    adb_path = shutil.which("adb")
-    if not adb_path:
-        return {"ok": False, "error": "adb not in PATH, 请在 WSL 中运行: sudo apt install android-tools-adb", "devices": []}
+def _auto_connect_known_ports() -> None:
+    """WSL 环境下尝试自动连接已知模拟器端口。"""
+    if not _HOST_IP:
+        return
+    for serial in KNOWN_EMULATOR_PORTS.values():
+        if not re.match(r"\d+\.\d+\.\d+\.\d+:\d+", serial):
+            continue
+        port = int(serial.split(":")[1])
+        try:
+            with _sock.create_connection((_HOST_IP, port), timeout=0.5):
+                _run_adb("", "connect", serial, timeout=5)
+        except OSError:
+            pass
 
-    rc, out, err = _run_adb("", "devices", "-l")
-    if rc != 0:
-        return {"ok": False, "error": err[:200], "devices": []}
 
+def _parse_device_lines(raw: str) -> list[dict]:
     devices = []
-    for line in out.strip().splitlines()[1:]:
+    for line in raw.strip().splitlines()[1:]:
         parts = line.split()
         if len(parts) >= 2:
-            serial = parts[0]
-            state = parts[1]
             model = ""
             for p in parts[2:]:
                 if p.startswith("model:"):
                     model = p.split(":", 1)[1]
             devices.append({
-                "serial": serial,
-                "state": state,
+                "serial": parts[0],
+                "state": parts[1],
                 "model": model,
             })
+    return devices
+
+
+def list_devices() -> dict:
+    """列出所有 ADB 设备及其状态，WSL 下自动探测已知模拟器端口。"""
+    adb_path = shutil.which("adb")
+    if not adb_path:
+        return {
+            "ok": False,
+            "error": "adb not in PATH, 请在 WSL 中运行: sudo apt install android-tools-adb",
+            "devices": [],
+        }
+
+    rc, out, err = _run_adb("", "devices", "-l")
+    if rc != 0:
+        return {"ok": False, "error": err[:200], "devices": []}
+
+    devices = _parse_device_lines(out)
+
+    # WSL 下如果没有 device 状态的设备，自动探测已知端口
+    online = [d for d in devices if d["state"] == "device"]
+    if not online and _HOST_IP:
+        _auto_connect_known_ports()
+        rc2, out2, _ = _run_adb("", "devices", "-l")
+        if rc2 == 0:
+            devices = _parse_device_lines(out2)
 
     return {
         "ok": True,
         "devices": devices,
         "known_ports": KNOWN_EMULATOR_PORTS,
         "host_ip": _HOST_IP,
-        "hint": f"WSL 环境检测到宿主机 IP: {_HOST_IP}，模拟器端口请使用 {_HOST_IP}:<port>" if _HOST_IP else None,
+        "hint": (
+            f"WSL 环境检测到宿主机 IP: {_HOST_IP}，"
+            f"模拟器端口请使用 {_HOST_IP}:<port>"
+        ) if _HOST_IP else None,
     }

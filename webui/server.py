@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -12,13 +13,22 @@ from .backend.routes import inventory as inventory_routes
 from .backend.routes import run as run_routes
 from .backend.routes import cloudflare_kv as cf_kv_routes
 from .backend.routes import whatsapp as whatsapp_routes
+from .backend.gost_manager import ensure_gost_alive
 
 
 FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    import asyncio
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, ensure_gost_alive)
+    yield
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="Gpt-Agreement-Payment webui")
+    app = FastAPI(title="Gpt-Agreement-Payment webui", lifespan=_lifespan)
     app.include_router(setup_routes.router)
     app.include_router(auth_routes.router)
     app.include_router(wizard_routes.router)
