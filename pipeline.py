@@ -2804,6 +2804,7 @@ def _ensure_gost_alive(card_cfg: dict, team_client=None, cfg_path: str | Path | 
     lock_country = _normalize_country((ws_cfg.get("lock_country") or ""))
 
     already_listening = False
+    need_chain_autodetect = False
     try:
         ck = subprocess.run(["ss", "-ltn", f"sport = :{listen_port}"],
                              capture_output=True, text=True, timeout=3)
@@ -2811,11 +2812,14 @@ def _ensure_gost_alive(card_cfg: dict, team_client=None, cfg_path: str | Path | 
     except Exception:
         pass
 
-    if already_listening and not lock_country:
+    if already_listening:
         if _local_gost_egress_ok(listen_port):
-            return True
-        print(f"[gost] listen :{listen_port} 已监听但出口不可用，重新拉起")
-        already_listening = False
+            if not lock_country:
+                return True
+        else:
+            print(f"[gost] listen :{listen_port} 已监听但出口不可用，重新拉起")
+            already_listening = False
+            need_chain_autodetect = True
 
     configured_px = _configured_webshare_proxy(ws_cfg)
     client = None
@@ -2890,12 +2894,17 @@ def _ensure_gost_alive(card_cfg: dict, team_client=None, cfg_path: str | Path | 
     proxy_port = int(px.get("port") or 80)
     if not px.get("proxy_address"):
         proxy_port = 80
+    chain_proxy = str(ws_cfg.get("gost_chain_proxy") or "").strip()
+    if not chain_proxy and need_chain_autodetect:
+        chain_proxy = _detect_host_outbound_proxy()
+        if chain_proxy:
+            print(f"[gost] 自动探测链式代理：{chain_proxy}")
     try:
         _swap_gost_relay(proxy_host, proxy_port,
                           px["username"], px["password"],
                           listen_port=listen_port,
                           upstream_scheme=upstream_scheme,
-                          chain_proxy=str(ws_cfg.get("gost_chain_proxy") or ""))
+                          chain_proxy=chain_proxy)
     except Exception as e:
         print(f"[gost] 拉起失败: {e}")
         return False

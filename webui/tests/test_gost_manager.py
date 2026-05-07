@@ -80,6 +80,42 @@ def test_ensure_gost_prefers_manual_proxy_without_webshare_lookup(monkeypatch):
     assert calls[-1][1][:4] == ("p.webshare.io", 80, "user", "pass")
 
 
+def test_ensure_gost_restarts_listening_port_when_egress_probe_fails(monkeypatch):
+    cfg = _temp_config_path()
+    _write_pay_config(cfg, {
+        "enabled": True,
+        "api_key": "secret",
+        "gost_listen_port": 18898,
+        "last_proxy": {
+            "proxy_address": "p.webshare.io",
+            "port": 80,
+            "username": "user",
+            "password": "pass",
+            "country_code": "GB",
+        },
+        "gost_chain_proxy": "http://192.168.0.2:7897",
+    })
+    calls = []
+
+    monkeypatch.setattr(gost_manager.s, "PAY_CONFIG_PATH", cfg)
+    monkeypatch.setattr(gost_manager, "_port_listening", lambda port: True)
+    monkeypatch.setattr(gost_manager, "_local_gost_egress_ok", lambda port: False)
+    monkeypatch.setattr(
+        gost_manager,
+        "_WebshareClient",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should use cached proxy")),
+    )
+    monkeypatch.setattr(
+        gost_manager,
+        "_swap_gost_relay",
+        lambda *args, **kwargs: calls.append(("swap", args, kwargs)),
+    )
+
+    assert gost_manager.ensure_gost_alive() is True
+    assert calls[-1][0] == "swap"
+    assert calls[-1][2]["chain_proxy"] == "http://192.168.0.2:7897"
+
+
 def test_webshare_client_uses_explicit_api_proxy(monkeypatch):
     handlers = []
 

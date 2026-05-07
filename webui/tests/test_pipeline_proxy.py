@@ -460,6 +460,87 @@ def test_pipeline_ensure_gost_restarts_existing_listener_when_egress_probe_fails
     assert calls[-1][0] == "swap"
 
 
+def test_pipeline_ensure_gost_restarts_lock_country_listener_when_egress_probe_fails(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        pipeline.subprocess,
+        "run",
+        lambda *args, **kwargs: type("Result", (), {"stdout": "LISTEN 0 4096 *:18898 *:*"})(),
+    )
+    monkeypatch.setattr(pipeline, "_local_gost_egress_ok", lambda port: False)
+    monkeypatch.setattr(
+        pipeline,
+        "WebshareClient",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should use cached proxy")),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_swap_gost_relay",
+        lambda *args, **kwargs: calls.append(("swap", args, kwargs)),
+    )
+
+    assert pipeline._ensure_gost_alive({
+        "webshare": {
+            "enabled": True,
+            "api_key": "secret",
+            "gost_listen_port": 18898,
+            "lock_country": "GB",
+            "last_proxy": {
+                "proxy_address": "p.webshare.io",
+                "port": 80,
+                "username": "user",
+                "password": "pass",
+                "country_code": "GB",
+            },
+            "gost_chain_proxy": "http://192.168.0.2:7897",
+        },
+    }) is True
+
+    assert calls[-1][0] == "swap"
+    assert calls[-1][2]["chain_proxy"] == "http://192.168.0.2:7897"
+
+
+def test_pipeline_ensure_gost_autodetects_chain_proxy_when_listener_is_broken(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        pipeline.subprocess,
+        "run",
+        lambda *args, **kwargs: type("Result", (), {"stdout": "LISTEN 0 4096 *:18898 *:*"})(),
+    )
+    monkeypatch.setattr(pipeline, "_local_gost_egress_ok", lambda port: False)
+    monkeypatch.setattr(pipeline, "_detect_host_outbound_proxy", lambda: "http://192.168.0.2:7897")
+    monkeypatch.setattr(
+        pipeline,
+        "WebshareClient",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should use cached proxy")),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_swap_gost_relay",
+        lambda *args, **kwargs: calls.append(("swap", args, kwargs)),
+    )
+
+    assert pipeline._ensure_gost_alive({
+        "webshare": {
+            "enabled": True,
+            "api_key": "secret",
+            "gost_listen_port": 18898,
+            "last_proxy": {
+                "proxy_address": "p.webshare.io",
+                "port": 80,
+                "username": "user",
+                "password": "pass",
+                "country_code": "GB",
+            },
+        },
+    }) is True
+
+    assert calls[-1][0] == "swap"
+    assert calls[-1][2]["chain_proxy"] == "http://192.168.0.2:7897"
+
+
 def test_local_gost_egress_probe_falls_back_to_next_ip_endpoint(monkeypatch):
     calls = []
 

@@ -20,6 +20,14 @@ from urllib.parse import urlparse
 from . import settings as s
 
 _CLASH_PORTS = (7897, 7890, 7891)
+_PROXY_IP_ENDPOINTS = (
+    "http://api.ipify.org",
+    "http://checkip.amazonaws.com",
+    "http://icanhazip.com",
+    "https://api.ipify.org",
+    "https://checkip.amazonaws.com",
+    "https://icanhazip.com",
+)
 
 
 def _port_listening(port: int) -> bool:
@@ -28,6 +36,31 @@ def _port_listening(port: int) -> bool:
             return True
     except OSError:
         return False
+
+
+def _local_gost_egress_ok(port: int) -> bool:
+    last_err = None
+    try:
+        import requests
+        proxy = f"socks5h://127.0.0.1:{port}"
+        proxies = {"http": proxy, "https": proxy}
+        timeout_s = float(os.environ.get("PROXY_IP_LOOKUP_TIMEOUT", "5") or 5)
+        for api in _PROXY_IP_ENDPOINTS:
+            try:
+                r = requests.get(api, proxies=proxies, timeout=timeout_s, verify=False)
+                r.raise_for_status()
+                if r.text.strip():
+                    return True
+            except Exception as e:
+                last_err = e
+                continue
+    except Exception as e:
+        last_err = e
+    if last_err:
+        print(f"[gost] 本地中继出口探测失败: {type(last_err).__name__}: {last_err}")
+    else:
+        print("[gost] 本地中继出口探测失败: no response")
+    return False
 
 
 def _detect_windows_host_ip() -> str:
@@ -291,9 +324,15 @@ def ensure_gost_alive() -> bool:
 
     lock_country = _normalize_country(ws_cfg.get("lock_country") or "")
 
-    if _port_listening(listen_port):
-        print(f"[gost] :{listen_port} 已有监听，无需重启")
-        return True
+    already_listening = _port_listening(listen_port)
+    need_chain_autodetect = False
+    if already_listening:
+        if _local_gost_egress_ok(listen_port):
+            print(f"[gost] :{listen_port} 已有监听且出口可用，无需重启")
+            return True
+        print(f"[gost] :{listen_port} 已监听但出口不可用，重新拉起")
+        already_listening = False
+        need_chain_autodetect = True
 
     print(f"[gost] :{listen_port} 无监听，自动拉起")
 
@@ -356,6 +395,11 @@ def ensure_gost_alive() -> bool:
     proxy_port = int(px.get("port") or 80)
     if not px.get("proxy_address"):
         proxy_port = 80
+    chain_proxy = str(ws_cfg.get("gost_chain_proxy") or "").strip()
+    if not chain_proxy and need_chain_autodetect:
+        chain_proxy = _detect_host_outbound_proxy()
+        if chain_proxy:
+            print(f"[gost] 自动探测链式代理：{chain_proxy}")
 
     try:
         _swap_gost_relay(
@@ -363,7 +407,7 @@ def ensure_gost_alive() -> bool:
             px["username"], px["password"],
             listen_port=listen_port,
             upstream_scheme=upstream_scheme,
-            chain_proxy=str(ws_cfg.get("gost_chain_proxy") or ""),
+            chain_proxy=chain_proxy,
         )
     except Exception as e:
         print(f"[gost] 拉起失败: {e}")
