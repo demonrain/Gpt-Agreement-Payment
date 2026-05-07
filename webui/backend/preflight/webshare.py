@@ -7,6 +7,7 @@ WS_API = "https://proxy.webshare.io/api/v2"
 
 class WebshareInput(BaseModel):
     api_key: str
+    api_proxy: str = ""
 
 
 def _build_result(checks: list[CheckResult]) -> PreflightResult:
@@ -20,7 +21,7 @@ def _build_result(checks: list[CheckResult]) -> PreflightResult:
 def check(body: dict) -> PreflightResult:
     cfg = WebshareInput.model_validate(body)
     headers = {"Authorization": f"Token {cfg.api_key}"}
-    proxy = resolve_system_proxy()
+    proxy = cfg.api_proxy.strip() or resolve_system_proxy()
     try:
         with httpx.Client(timeout=15.0, proxy=proxy) as c:
             r = c.get(f"{WS_API}/proxy/list/", headers=headers,

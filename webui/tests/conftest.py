@@ -1,6 +1,17 @@
 import pytest
+import uuid
+from pathlib import Path
 from fastapi.testclient import TestClient
 from webui.server import create_app
+
+
+@pytest.fixture
+def tmp_path():
+    base = Path(__file__).resolve().parents[2] / "output" / "pytest-tmp"
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / uuid.uuid4().hex
+    path.mkdir()
+    return path
 
 
 @pytest.fixture

@@ -32,6 +32,15 @@ from urllib.parse import urlparse, urlencode, parse_qs
 
 logger = logging.getLogger(__name__)
 
+_PROXY_IP_ENDPOINTS = (
+    "http://api.ipify.org",
+    "http://checkip.amazonaws.com",
+    "http://icanhazip.com",
+    "https://api.ipify.org",
+    "https://checkip.amazonaws.com",
+    "https://icanhazip.com",
+)
+
 
 def _gen_name() -> tuple[str, str]:
     first_names = ["James", "John", "Emily", "Sophia", "Michael", "Oliver", "Emma",
@@ -95,17 +104,21 @@ def _resolve_proxy_ip(proxy_url: str) -> Optional[str]:
     if pp.username:
         h_url = f"socks5h://{pp.username}:{pp.password}@{pp.hostname}:{pp.port}"
     proxies = {"http": h_url, "https": h_url}
-    for api in ("https://api.ipify.org", "https://checkip.amazonaws.com", "https://icanhazip.com"):
+    last_err = None
+    timeout_s = float(os.environ.get("PROXY_IP_LOOKUP_TIMEOUT", "5") or 5)
+    for api in _PROXY_IP_ENDPOINTS:
         try:
-            r = _req.get(api, proxies=proxies, timeout=10, verify=False)
+            r = _req.get(api, proxies=proxies, timeout=timeout_s, verify=False)
             r.raise_for_status()
             ip = r.text.strip()
             if ip:
                 logger.info(f"[browser-reg] 代理出口 IP: {ip}")
                 return ip
-        except Exception:
+        except Exception as e:
+            last_err = e
             continue
-    logger.warning("[browser-reg] 无法通过代理获取出口 IP，将跳过 geoip")
+    suffix = f": {type(last_err).__name__}: {last_err}" if last_err else ""
+    logger.warning(f"[browser-reg] 无法通过代理获取出口 IP，将跳过 geoip{suffix}")
     return None
 
 
@@ -132,6 +145,7 @@ def browser_register(cfg, mail_provider) -> dict:
     cf_proxy = _parse_proxy(cfg.proxy)
     # 预解析代理出口 IP，避免 Camoufox 内部用 socks5:// 做 GeoIP 查询失败
     proxy_ip = _resolve_proxy_ip(cfg.proxy)
+    geoip_arg = proxy_ip if proxy_ip else (False if cfg.proxy else True)
     has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
     tmp_profile = tempfile.mkdtemp(prefix="chatgpt_reg_")
@@ -158,7 +172,7 @@ def browser_register(cfg, mail_provider) -> dict:
             os="windows",
             screen=Screen(max_width=1920, max_height=1080),
             proxy=cf_proxy,
-            geoip=proxy_ip or True,
+            geoip=geoip_arg,
             locale="en-US",
         ) as ctx:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()

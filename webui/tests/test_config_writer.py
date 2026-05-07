@@ -81,6 +81,44 @@ def test_export_backs_up_existing(client, tmp_path, monkeypatch):
     assert json.loads(backups[0].read_text()) == {"old": True}
 
 
+def test_export_preserves_existing_webshare_last_proxy(client, tmp_path, monkeypatch):
+    _login(client)
+    _seed(tmp_path, monkeypatch)
+
+    pay_path = tmp_path / "CTF-pay" / "config.paypal.json"
+    pay_path.parent.mkdir(parents=True, exist_ok=True)
+    pay_path.write_text(json.dumps({
+        "webshare": {
+            "last_proxy": {
+                "proxy_address": "p.webshare.io",
+                "port": 80,
+                "username": "user",
+                "password": "pass",
+                "country_code": "US",
+            },
+        },
+    }))
+
+    answers = {
+        "proxy": {
+            "mode": "webshare",
+            "api_key": "secret",
+            "gost_listen_port": 18898,
+        },
+    }
+    r = client.post("/api/config/export", json={"answers": answers})
+    assert r.status_code == 200
+
+    pay = json.loads(pay_path.read_text())
+    assert pay["webshare"]["last_proxy"] == {
+        "proxy_address": "p.webshare.io",
+        "port": 80,
+        "username": "user",
+        "password": "pass",
+        "country_code": "US",
+    }
+
+
 def test_export_writes_gopay_auto_otp(client, tmp_path, monkeypatch):
     _login(client)
     _seed(tmp_path, monkeypatch)

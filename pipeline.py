@@ -25,10 +25,12 @@ import json
 import os
 import random
 import shutil
+import socket as _sock
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -920,7 +922,7 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
     cardw_config_path = _load_cardw_path_from_card_cfg(card_cfg, cardw_config_path)
 
     # single 模式也需要确保 gost 按 lock_country 配置运行
-    _ensure_gost_alive(card_cfg, team_client)
+    _ensure_gost_alive(card_cfg, team_client, cfg_path=card_config_path)
 
     # 内部 fallback：如果外部没传 pool/team/proxy，也自动构造（单次调用场景）
     owned_pool = False
@@ -2032,7 +2034,7 @@ def daemon(card_config_path, cardw_config_path=None, use_paypal=False,
     ))
     _cleanup_dead_cf_subdomains(getattr(pool, "provisioner", None), cf_db_path)
     # 启动时检查 gost（断了自动拉起）
-    _ensure_gost_alive(card_cfg, team_client)
+    _ensure_gost_alive(card_cfg, team_client, cfg_path=card_config_path)
 
     _hour_label = f"{rate_per_hour}/h" if rate_per_hour > 0 else "无限"
     _day_label = f"{rate_per_day}/d" if rate_per_day > 0 else "无限"
@@ -2161,7 +2163,7 @@ def daemon(card_config_path, cardw_config_path=None, use_paypal=False,
         state["rate_hour_ts"].append(run_ts)
         state["rate_day_ts"].append(run_ts)
         # 每轮前确认 gost 活着（避免 camoufox geoip 失败）
-        _ensure_gost_alive(card_cfg, team_client)
+        _ensure_gost_alive(card_cfg, team_client, cfg_path=card_config_path)
         try:
             rec = pipeline(card_config_path, **kwargs)
             status = rec.get("payment", {}).get("status", "?")
@@ -2434,34 +2436,97 @@ def _build_sub2api_client_from_card_cfg(card_cfg):
 # ──────────────────────────────────────────────
 
 _CLASH_PORTS = (7897, 7890, 7891)
+_DEFAULT_WEBSHARE_TIMEOUT_S = 8
+_PROXY_IP_ENDPOINTS = (
+    "http://api.ipify.org",
+    "http://checkip.amazonaws.com",
+    "http://icanhazip.com",
+    "https://api.ipify.org",
+    "https://checkip.amazonaws.com",
+    "https://icanhazip.com",
+)
 
 
-def _resolve_outbound_proxy() -> str:
-    """解析系统代理：优先环境变量，WSL 下回退探测宿主 Clash"""
-    import socket as _sock
-    env = (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-           or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy"))
-    if env:
-        return env
-    if not os.environ.get("WSL_DISTRO_NAME"):
+def _detect_windows_host_ip() -> str:
+    try:
+        from webui.backend.preflight import adb as adb_check
+        return adb_check._detect_host_ip() or ""
+    except Exception:
         return ""
+
+
+def _detect_wsl_gateway_ip() -> str:
     try:
         with open("/proc/net/route") as f:
             for line in f:
                 parts = line.split()
                 if len(parts) >= 3 and parts[1] == "00000000":
                     h = parts[2]
-                    host = ".".join(str(int(h[i:i + 2], 16)) for i in (6, 4, 2, 0))
-                    for port in _CLASH_PORTS:
-                        try:
-                            s = _sock.create_connection((host, port), timeout=1)
-                            s.close()
-                            return f"http://{host}:{port}"
-                        except OSError:
-                            continue
+                    return ".".join(
+                        str(int(h[i:i + 2], 16)) for i in (6, 4, 2, 0)
+                    )
     except OSError:
-        pass
+        return ""
     return ""
+
+
+def _env_outbound_proxy() -> str:
+    return (
+        os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+        or ""
+    )
+
+
+def _detect_host_outbound_proxy() -> str:
+    if not os.environ.get("WSL_DISTRO_NAME"):
+        return ""
+    hosts = []
+    for host in (_detect_windows_host_ip(), _detect_wsl_gateway_ip()):
+        if host and host not in hosts:
+            hosts.append(host)
+    for host in hosts:
+        for port in _CLASH_PORTS:
+            try:
+                s = _sock.create_connection((host, port), timeout=1)
+                s.close()
+                return f"http://{host}:{port}"
+            except OSError:
+                continue
+    return ""
+
+
+def _resolve_outbound_proxy() -> str:
+    """解析系统代理：优先环境变量，WSL 下回退探测宿主机 Clash。"""
+    env = _env_outbound_proxy()
+    use_env = os.environ.get("GPT_PAY_USE_ENV_PROXY", "").strip().lower()
+    if env and use_env in {"1", "true", "yes", "on"}:
+        return env
+    auto_detect = os.environ.get("GPT_PAY_AUTO_DETECT_HOST_PROXY", "").strip().lower()
+    if auto_detect not in {"1", "true", "yes", "on"}:
+        return ""
+    return _detect_host_outbound_proxy()
+
+
+def _webshare_api_retry_proxies(initial_proxy: str = "") -> list[str]:
+    """Return retry-only proxies for Webshare API lookup after a direct failure."""
+    seen = {str(initial_proxy or "").strip()}
+    candidates = []
+    for proxy in (_env_outbound_proxy(), _detect_host_outbound_proxy()):
+        proxy = str(proxy or "").strip()
+        if proxy and proxy not in seen:
+            candidates.append(proxy)
+            seen.add(proxy)
+    return candidates
+
+
+def _webshare_api_proxy_from_cfg(ws_cfg: dict) -> str:
+    return (
+        ws_cfg.get("api_proxy")
+        or os.environ.get("WEBSHARE_API_PROXY")
+        or os.environ.get("GPT_PAY_WEBSHARE_API_PROXY")
+        or ""
+    )
 
 
 class WebshareQuotaExhausted(RuntimeError):
@@ -2474,11 +2539,10 @@ class WebshareClient:
 
     BASE = "https://proxy.webshare.io/api/v2"
 
-    def __init__(self, api_key: str, timeout_s: int = 30):
-        import urllib.request
+    def __init__(self, api_key: str, timeout_s: int = 30, api_proxy: str = ""):
         self.api_key = api_key.strip()
         self.timeout_s = timeout_s
-        proxy = _resolve_outbound_proxy()
+        proxy = str(api_proxy or "").strip() or _resolve_outbound_proxy()
         handler = urllib.request.ProxyHandler(
             {"http": proxy, "https": proxy} if proxy else {}
         )
@@ -2592,7 +2656,8 @@ class WebshareClient:
 
 
 def _swap_gost_relay(new_ip: str, new_port: int, username: str, password: str,
-                       listen_port: int = 18898, upstream_scheme: str = "http") -> None:
+                       listen_port: int = 18898, upstream_scheme: str = "http",
+                       chain_proxy: str = "") -> None:
     """把监听 listen_port 的 gost 换成新上游。安全匹配进程命令行中的 -L=socks5://:<port> 片段。"""
     import signal
     listen_pat = f"-L=socks5://:{listen_port}"
@@ -2630,7 +2695,7 @@ def _swap_gost_relay(new_ip: str, new_port: int, username: str, password: str,
     upstream = f"{upstream_scheme}://{username}:{password}@{new_ip}:{new_port}"
     http_port = listen_port + 1
     cmd = ["gost", f"-L=socks5://:{listen_port}", f"-L=http://:{http_port}"]
-    local_proxy = _resolve_outbound_proxy()
+    local_proxy = str(chain_proxy or "").strip() or _resolve_outbound_proxy()
     if local_proxy:
         cmd.append(f"-F={local_proxy}")
         print(f"[gost] WSL 链式代理：先过 {local_proxy}")
@@ -2657,7 +2722,75 @@ def _normalize_country(code: str) -> str:
     return _COUNTRY_ALIAS.get(c, c)
 
 
-def _ensure_gost_alive(card_cfg: dict, team_client=None) -> bool:
+def _local_gost_egress_ok(listen_port: int) -> bool:
+    """Probe the local gost relay so stale listeners do not mask a broken upstream."""
+    last_err = None
+    try:
+        import requests as _req
+        proxy = f"socks5h://127.0.0.1:{listen_port}"
+        proxies = {"http": proxy, "https": proxy}
+        timeout_s = float(os.environ.get("PROXY_IP_LOOKUP_TIMEOUT", "5") or 5)
+        for api in _PROXY_IP_ENDPOINTS:
+            try:
+                r = _req.get(api, proxies=proxies, timeout=timeout_s, verify=False)
+                r.raise_for_status()
+                if r.text.strip():
+                    return True
+            except Exception as e:
+                last_err = e
+                continue
+    except Exception as e:
+        last_err = e
+    if last_err:
+        print(f"[gost] 本地中继出口探测失败: {type(last_err).__name__}: {last_err}")
+    else:
+        print("[gost] 本地中继出口探测失败: no response")
+    return False
+
+
+def _usable_webshare_proxy(px: dict | None) -> bool:
+    if not isinstance(px, dict):
+        return False
+    return bool(px.get("username") and px.get("password"))
+
+
+def _configured_webshare_proxy(ws_cfg: dict) -> dict:
+    for key in ("manual_proxy", "last_proxy"):
+        px = ws_cfg.get(key) or {}
+        if _usable_webshare_proxy(px):
+            return px
+    return {}
+
+
+def _cache_webshare_proxy(card_cfg: dict, px: dict) -> None:
+    if not _usable_webshare_proxy(px):
+        return
+    try:
+        ws_cfg = (card_cfg or {}).setdefault("webshare", {})
+        ws_cfg["last_proxy"] = {
+            "proxy_address": px.get("proxy_address") or "p.webshare.io",
+            "port": int(px.get("port") or 80),
+            "username": px.get("username") or "",
+            "password": px.get("password") or "",
+            "country_code": px.get("country_code") or "",
+        }
+    except Exception as e:
+        print(f"[gost] 缓存 Webshare 代理失败: {e}")
+
+
+def _persist_webshare_proxy_cache(cfg_path: str | Path | None, px: dict) -> None:
+    if not cfg_path or not _usable_webshare_proxy(px):
+        return
+    path = Path(cfg_path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        _cache_webshare_proxy(data, px)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[gost] 持久化 Webshare 代理缓存失败: {e}")
+
+
+def _ensure_gost_alive(card_cfg: dict, team_client=None, cfg_path: str | Path | None = None) -> bool:
     """启动/循环前调。检 listen_port 是否有进程监听且代理国家匹配 lock_country；
     不匹配或未监听时从 Webshare API 拿匹配 lock_country 的 IP 自动拉起 gost。
     成功返回 True，失败 False。"""
@@ -2678,15 +2811,25 @@ def _ensure_gost_alive(card_cfg: dict, team_client=None) -> bool:
     except Exception:
         pass
 
+    if already_listening and not lock_country:
+        if _local_gost_egress_ok(listen_port):
+            return True
+        print(f"[gost] listen :{listen_port} 已监听但出口不可用，重新拉起")
+        already_listening = False
+
+    configured_px = _configured_webshare_proxy(ws_cfg)
     client = None
-    try:
-        client = WebshareClient(api_key)
-    except Exception as e:
-        print(f"[gost] WebshareClient 初始化失败: {e}")
-        return already_listening
+    timeout_s = int(ws_cfg.get("api_timeout_s") or _DEFAULT_WEBSHARE_TIMEOUT_S)
+    api_proxy = _webshare_api_proxy_from_cfg(ws_cfg)
+    if not configured_px:
+        try:
+            client = WebshareClient(api_key, timeout_s=timeout_s, api_proxy=api_proxy)
+        except Exception as e:
+            print(f"[gost] WebshareClient 初始化失败: {e}")
+            return already_listening
 
     # 验证当前代理国家是否匹配 lock_country
-    if already_listening and lock_country:
+    if already_listening and lock_country and client:
         try:
             px = client.get_current_proxy()
             cur_country = _normalize_country(px.get("country_code") or "")
@@ -2703,16 +2846,45 @@ def _ensure_gost_alive(card_cfg: dict, team_client=None) -> bool:
         print(f"[gost] listen :{listen_port} 无监听，自动拉起")
 
     # 获取匹配 lock_country 的代理
-    px = None
-    try:
-        if lock_country:
-            # 先尝试获取指定国家的代理
-            px = client.get_proxy_by_country(lock_country)
+    px = configured_px or None
+    if px:
+        _cache_webshare_proxy(card_cfg, px)
+    else:
+        lookup_error = None
+        clients = [client]
+        retry_clients_added = False
+        for lookup_client in clients:
+            try:
+                if lock_country:
+                    # 先尝试获取指定国家的代理
+                    px = lookup_client.get_proxy_by_country(lock_country)
+                if not px:
+                    px = lookup_client.get_current_proxy()
+                break
+            except Exception as e:
+                lookup_error = e
+                if not api_proxy and not retry_clients_added:
+                    retry_clients_added = True
+                    for retry_proxy in _webshare_api_retry_proxies(api_proxy):
+                        try:
+                            clients.append(WebshareClient(
+                                api_key, timeout_s=timeout_s, api_proxy=retry_proxy
+                            ))
+                        except Exception as init_e:
+                            print(f"[gost] WebshareClient 代理初始化失败({retry_proxy}): {init_e}")
+                continue
         if not px:
-            px = client.get_current_proxy()
-    except Exception as e:
-        print(f"[gost] 查询 Webshare IP 失败: {e}")
-        return False
+            print(f"[gost] 查询 Webshare IP 失败: {lookup_error}")
+            cached = ws_cfg.get("last_proxy") or {}
+            if _usable_webshare_proxy(cached):
+                px = cached
+                print("[gost] 使用上次缓存的 Webshare 代理继续拉起")
+            else:
+                print("[gost] 无可用缓存代理，跳过 gost 自动拉起")
+                return False
+        else:
+            _cache_webshare_proxy(card_cfg, px)
+            _persist_webshare_proxy_cache(cfg_path, px)
     upstream_scheme = str(ws_cfg.get("gost_upstream_scheme", "http"))
     proxy_host = px.get("proxy_address") or "p.webshare.io"
     proxy_port = int(px.get("port") or 80)
@@ -2722,7 +2894,8 @@ def _ensure_gost_alive(card_cfg: dict, team_client=None) -> bool:
         _swap_gost_relay(proxy_host, proxy_port,
                           px["username"], px["password"],
                           listen_port=listen_port,
-                          upstream_scheme=upstream_scheme)
+                          upstream_scheme=upstream_scheme,
+                          chain_proxy=str(ws_cfg.get("gost_chain_proxy") or ""))
     except Exception as e:
         print(f"[gost] 拉起失败: {e}")
         return False
@@ -2753,31 +2926,56 @@ def _rotate_webshare_ip(card_cfg: dict, team_client=None, prev_ip: str = "") -> 
     team_scheme = str(ws_cfg.get("team_proxy_scheme", "socks5"))
     sync_team = bool(ws_cfg.get("sync_team_proxy", True))
     poll_wait = int(ws_cfg.get("poll_timeout_s", 120))
-
-    client = WebshareClient(api_key)
-    is_rotating = False
-    try:
-        quota = client.get_replacement_quota()
-        print(f"[Webshare] 替换额度：available={quota['available']}/{quota['total']} used={quota['used']}")
-        is_rotating = quota.get("total", 0) == 0
-        if not is_rotating and quota["available"] <= 0:
-            raise WebshareQuotaExhausted(f"quota: {quota}")
-    except WebshareQuotaExhausted:
-        raise
-    except Exception as e:
-        print(f"[Webshare] 查询额度异常（继续）: {e}")
+    timeout_s = int(ws_cfg.get("api_timeout_s") or _DEFAULT_WEBSHARE_TIMEOUT_S)
+    api_proxy = _webshare_api_proxy_from_cfg(ws_cfg)
 
     lock_country = _normalize_country(str(ws_cfg.get("lock_country", "")))
-    if is_rotating:
-        print(f"[Webshare] Rotating 计划，跳过 refresh，重启 gost 获取新连接")
-        new_px = client.get_current_proxy()
-    else:
-        if lock_country:
-            print(f"[Webshare] refresh pool，锁国家={lock_country}（prev_ip={prev_ip or '?'}）")
-        else:
-            print(f"[Webshare] refresh pool（prev_ip={prev_ip or '?'}）")
-        client.refresh_pool(country=lock_country)
-        new_px = client.wait_for_fresh_proxy(prev_ip=prev_ip, max_wait_s=poll_wait)
+    lookup_error = None
+    clients = [WebshareClient(api_key, timeout_s=timeout_s, api_proxy=api_proxy)]
+    retry_clients_added = False
+    new_px = None
+    for client in clients:
+        is_rotating = False
+        try:
+            try:
+                quota = client.get_replacement_quota()
+                print(f"[Webshare] 替换额度：available={quota['available']}/{quota['total']} used={quota['used']}")
+                is_rotating = quota.get("total", 0) == 0
+                if not is_rotating and quota["available"] <= 0:
+                    raise WebshareQuotaExhausted(f"quota: {quota}")
+            except WebshareQuotaExhausted:
+                raise
+            except Exception as e:
+                print(f"[Webshare] 查询额度异常（继续）: {e}")
+
+            if is_rotating:
+                print(f"[Webshare] Rotating 计划，跳过 refresh，重启 gost 获取新连接")
+                new_px = client.get_current_proxy()
+            else:
+                if lock_country:
+                    print(f"[Webshare] refresh pool，锁国家={lock_country}（prev_ip={prev_ip or '?'}）")
+                else:
+                    print(f"[Webshare] refresh pool（prev_ip={prev_ip or '?'}）")
+                client.refresh_pool(country=lock_country)
+                new_px = client.wait_for_fresh_proxy(prev_ip=prev_ip, max_wait_s=poll_wait)
+            break
+        except WebshareQuotaExhausted:
+            raise
+        except Exception as e:
+            lookup_error = e
+            if not api_proxy and not retry_clients_added:
+                retry_clients_added = True
+                for retry_proxy in _webshare_api_retry_proxies(api_proxy):
+                    try:
+                        clients.append(WebshareClient(
+                            api_key, timeout_s=timeout_s, api_proxy=retry_proxy
+                        ))
+                    except Exception as init_e:
+                        print(f"[Webshare] API 代理初始化失败({retry_proxy}): {init_e}")
+            continue
+
+    if not new_px:
+        raise RuntimeError(f"Webshare IP 轮换失败: {lookup_error}")
     new_host = new_px.get("proxy_address") or "p.webshare.io"
     new_port = int(new_px.get("port") or 80)
     if not new_px.get("proxy_address"):
@@ -2788,7 +2986,8 @@ def _rotate_webshare_ip(card_cfg: dict, team_client=None, prev_ip: str = "") -> 
           f"{new_px.get('country_code')}/{new_px.get('asn_name')}  valid={new_px.get('valid')}")
 
     _swap_gost_relay(new_host, new_port, user, pw,
-                      listen_port=listen_port, upstream_scheme=upstream_scheme)
+                      listen_port=listen_port, upstream_scheme=upstream_scheme,
+                      chain_proxy=str(ws_cfg.get("gost_chain_proxy") or ""))
 
     if sync_team and team_client:
         team_url = f"{team_scheme}://{user}:{pw}@{new_host}:{new_port}"
@@ -3516,7 +3715,7 @@ def free_register_loop(card_config_path, cardw_config_path=None, count: int = 0)
     proxy_url = card_cfg.get("proxy", "")
 
     # 启 gost（如果配了 webshare）
-    _ensure_gost_alive(card_cfg)
+    _ensure_gost_alive(card_cfg, cfg_path=card_config_path)
 
     # OAuth Codex client_id：card.py:_exchange_refresh_token_with_session 读
     # OAUTH_CODEX_CLIENT_ID env var；从 cpa.oauth_client_id 推过去（subprocess
@@ -3610,7 +3809,7 @@ def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
     mail_cfg = card_cfg.get("mail") or {}
     proxy_url = card_cfg.get("proxy", "")
 
-    _ensure_gost_alive(card_cfg)
+    _ensure_gost_alive(card_cfg, cfg_path=card_config_path)
 
     # OAuth Codex client_id（同 free_register_loop，避免 AuthApiFailure）
     _client_id = (cpa_cfg.get("oauth_client_id") or "").strip()

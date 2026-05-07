@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import os
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -21,9 +22,11 @@ FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    import asyncio
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, ensure_gost_alive)
+    autostart = os.getenv("WEBUI_AUTOSTART_GOST", "").strip().lower()
+    if autostart in {"1", "true", "yes", "on"}:
+        import asyncio
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, ensure_gost_alive)
     yield
 
 
@@ -75,6 +78,16 @@ def create_app() -> FastAPI:
     return app
 
 
+def _get_bind_settings() -> tuple[str, int]:
+    host = os.getenv("WEBUI_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    try:
+        port = int(os.getenv("WEBUI_PORT", "8765") or "8765")
+    except ValueError:
+        port = 8765
+    return host, port
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(create_app(), host="127.0.0.1", port=8765)
+    bind_host, bind_port = _get_bind_settings()
+    uvicorn.run(create_app(), host=bind_host, port=bind_port)

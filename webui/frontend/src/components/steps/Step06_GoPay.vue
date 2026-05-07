@@ -145,6 +145,7 @@ const adbTestResult = ref<PreflightResult | null>(null);
 
 const adbQuickPorts = ref([
   { name: "MuMu", serial: "127.0.0.1:7555" },
+  { name: "MuMu 12", serial: "127.0.0.1:16348" },
   { name: "MuMu 12", serial: "127.0.0.1:16384" },
   { name: "雷电", serial: "emulator-5554" },
   { name: "夜神", serial: "127.0.0.1:62001" },

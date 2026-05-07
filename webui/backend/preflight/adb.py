@@ -15,47 +15,138 @@ import re
 import shutil
 import socket as _sock
 import subprocess
+import time
+import ipaddress
 from pathlib import Path
 from ._common import CheckResult, PreflightResult, aggregate
+
+_HOST_IP_CACHE_TTL_S = int(os.environ.get("GPT_PAY_HOST_IP_CACHE_TTL_S", "300") or 300)
+_HOST_IP_CACHE: tuple[str, float] = ("", 0.0)
+
+
+def _valid_ipv4(value: str | None) -> str | None:
+    value = str(value or "").strip()
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if ip.version != 4 or ip.is_loopback or ip.is_unspecified:
+        return None
+    return value
+
+
+def _is_wsl() -> bool:
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/version").read_text(errors="ignore").lower()
+    except Exception:
+        return False
+
+
+def _read_resolv_nameserver() -> str | None:
+    resolv = Path("/etc/resolv.conf")
+    if not resolv.exists():
+        return None
+    try:
+        for line in resolv.read_text().splitlines():
+            if line.strip().startswith("nameserver"):
+                return _valid_ipv4(line.split()[1])
+    except Exception:
+        return None
+    return None
+
+
+def _detect_windows_host_ip_via_powershell(nameserver_ip: str | None = None) -> str | None:
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh.exe")
+    if not powershell:
+        return None
+    try:
+        ps = (
+            "Get-NetIPAddress -AddressFamily IPv4 | "
+            "Where-Object { $_.IPAddress -notlike '127.*' -and "
+            "$_.IPAddress -notlike '169.254.*' -and "
+            "$_.PrefixOrigin -ne 'WellKnown' } | "
+            "Select-Object -ExpandProperty IPAddress"
+        )
+        r = subprocess.run(
+            [powershell, "-NoProfile", "-Command", ps],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    candidates = [
+        ip for ip in (_valid_ipv4(line) for line in r.stdout.splitlines())
+        if ip and ip != nameserver_ip
+    ]
+    if not candidates:
+        return None
+    if nameserver_ip:
+        try:
+            net = ipaddress.ip_network(f"{nameserver_ip}/24", strict=False)
+            for ip in candidates:
+                if ipaddress.ip_address(ip) in net:
+                    return ip
+        except ValueError:
+            pass
+    return candidates[0]
 
 
 def _detect_host_ip() -> str | None:
     """WSL/Docker 环境下获取宿主机 IP（用于连接宿主机上的模拟器）。"""
-    # WSL2: resolv.conf 中的 nameserver 就是宿主机
-    resolv = Path("/etc/resolv.conf")
-    if resolv.exists():
-        try:
-            for line in resolv.read_text().splitlines():
-                if line.strip().startswith("nameserver"):
-                    ip = line.split()[1]
-                    if ip != "127.0.0.1":
-                        return ip
-        except Exception:
-            pass
+    for key in ("GPT_PAY_ADB_HOST_IP", "WSL_ADB_HOST_IP", "ADB_HOST_IP", "WINDOWS_HOST_IP"):
+        ip = _valid_ipv4(os.environ.get(key))
+        if ip:
+            return ip
+
+    global _HOST_IP_CACHE
+    cached_ip, cached_ts = _HOST_IP_CACHE
+    now = time.monotonic()
+    if cached_ip and now - cached_ts < _HOST_IP_CACHE_TTL_S:
+        return cached_ip
+
+    nameserver_ip = _read_resolv_nameserver()
+    if _is_wsl():
+        win_ip = _detect_windows_host_ip_via_powershell(nameserver_ip)
+        if win_ip:
+            _HOST_IP_CACHE = (win_ip, now)
+            return win_ip
+        if nameserver_ip:
+            _HOST_IP_CACHE = (nameserver_ip, now)
+        return nameserver_ip
+
     # Docker: host.docker.internal
     if os.path.exists("/.dockerenv"):
         return "host.docker.internal"
-    return None
+    if nameserver_ip:
+        _HOST_IP_CACHE = (nameserver_ip, now)
+    return nameserver_ip
 
 
 _HOST_IP = _detect_host_ip()
 
-# 各模拟器常见 ADB 端口（使用检测到的宿主机 IP 或 127.0.0.1）
-_H = _HOST_IP or "127.0.0.1"
-# MuMu 12 实例端口规则: 16384 + 32 * instance_index
-_MUMU12_INSTANCE_PORTS = [16384 + 32 * i for i in range(4)]
-KNOWN_EMULATOR_PORTS = {
-    "mumu6": f"{_H}:7555",
-    "mumu12_0": f"{_H}:16384",
-    "mumu12_1": f"{_H}:16416",
-    "mumu12_2": f"{_H}:16448",
-    "mumu12_3": f"{_H}:16480",
-    "mumu12_adb0": f"{_H}:5555",
-    "mumu12_adb1": f"{_H}:5557",
-    "ldplayer": "emulator-5554",
-    "nox": f"{_H}:62001",
-    "bluestacks": f"{_H}:5555",
-}
+
+def _known_emulator_ports(host_ip: str | None = None) -> dict[str, str]:
+    """各模拟器常见 ADB 端口（WSL/Docker 用宿主机 IP，本机用 127.0.0.1）。"""
+    host = host_ip or "127.0.0.1"
+    return {
+        "mumu6": f"{host}:7555",
+        "mumu12_legacy": f"{host}:16348",
+        "mumu12_0": f"{host}:16384",
+        "mumu12_1": f"{host}:16416",
+        "mumu12_2": f"{host}:16448",
+        "mumu12_3": f"{host}:16480",
+        "mumu12_adb0": f"{host}:5555",
+        "mumu12_adb1": f"{host}:5557",
+        "ldplayer": "emulator-5554",
+        "nox": f"{host}:62001",
+        "bluestacks": f"{host}:5555",
+    }
+
+
+KNOWN_EMULATOR_PORTS = _known_emulator_ports(_HOST_IP)
 
 
 def _run_adb(serial: str, *args: str, timeout: int = 10) -> tuple[int, str, str]:
@@ -122,11 +213,10 @@ def check(body: dict) -> PreflightResult:
         ))
         return aggregate(checks)
 
-    device_lines = [
-        l for l in out.strip().splitlines()[1:]
-        if l.strip() and "device" in l
+    all_devices = [
+        d["serial"] for d in _parse_device_lines(out)
+        if d["state"] == "device"
     ]
-    all_devices = [l.split()[0] for l in device_lines if l.split()]
 
     if serial:
         found = any(serial in d or d in serial for d in all_devices)
@@ -200,24 +290,40 @@ def check(body: dict) -> PreflightResult:
     return aggregate(checks)
 
 
-def _auto_connect_known_ports() -> None:
-    """WSL 环境下尝试自动连接已知模拟器端口。"""
-    if not _HOST_IP:
-        return
-    for serial in KNOWN_EMULATOR_PORTS.values():
+def _auto_connect_known_ports(known_ports: dict[str, str] | None = None) -> None:
+    """尝试自动连接已知 TCP ADB 端口。"""
+    for serial in (known_ports or KNOWN_EMULATOR_PORTS).values():
         if not re.match(r"\d+\.\d+\.\d+\.\d+:\d+", serial):
             continue
+        host = serial.split(":", 1)[0]
         port = int(serial.split(":")[1])
         try:
-            with _sock.create_connection((_HOST_IP, port), timeout=0.5):
+            with _sock.create_connection((host, port), timeout=0.5):
                 _run_adb("", "connect", serial, timeout=5)
         except OSError:
             pass
 
 
+def _disconnect_offline_tcp_devices(devices: list[dict]) -> None:
+    """清理 stale TCP ADB 连接，避免旧 offline 设备占住扫描结果。"""
+    for dev in devices:
+        serial = str(dev.get("serial") or "")
+        if dev.get("state") != "offline":
+            continue
+        if not re.match(r"\d+\.\d+\.\d+\.\d+:\d+", serial):
+            continue
+        _run_adb("", "disconnect", serial, timeout=5)
+
+
 def _parse_device_lines(raw: str) -> list[dict]:
     devices = []
-    for line in raw.strip().splitlines()[1:]:
+    seen_header = False
+    for line in raw.strip().splitlines():
+        if line.strip().startswith("List of devices"):
+            seen_header = True
+            continue
+        if not seen_header:
+            continue
         parts = line.split()
         if len(parts) >= 2:
             model = ""
@@ -234,6 +340,10 @@ def _parse_device_lines(raw: str) -> list[dict]:
 
 def list_devices() -> dict:
     """列出所有 ADB 设备及其状态，WSL 下自动探测已知模拟器端口。"""
+    global _HOST_IP, KNOWN_EMULATOR_PORTS
+    _HOST_IP = _detect_host_ip()
+    KNOWN_EMULATOR_PORTS = _known_emulator_ports(_HOST_IP)
+
     adb_path = shutil.which("adb")
     if not adb_path:
         return {
@@ -248,10 +358,11 @@ def list_devices() -> dict:
 
     devices = _parse_device_lines(out)
 
-    # WSL 下如果没有 device 状态的设备，自动探测已知端口
+    # 如果没有 device 状态的设备，自动探测已知 TCP ADB 端口
     online = [d for d in devices if d["state"] == "device"]
-    if not online and _HOST_IP:
-        _auto_connect_known_ports()
+    if not online:
+        _disconnect_offline_tcp_devices(devices)
+        _auto_connect_known_ports(KNOWN_EMULATOR_PORTS)
         rc2, out2, _ = _run_adb("", "devices", "-l")
         if rc2 == 0:
             devices = _parse_device_lines(out2)

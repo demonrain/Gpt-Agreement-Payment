@@ -26,6 +26,13 @@ def _payment_method(answers: dict) -> str:
     return (answers.get("payment") or {}).get("method", "both")
 
 
+def _existing_pay_config() -> dict:
+    try:
+        return json.loads(s.PAY_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def _daemon_from_wizard(da: dict | None) -> dict:
     """将向导扁平字段转为 pay JSON 的 daemon 段（与 pipeline.daemon 读取一致）。"""
     if not da or not isinstance(da, dict):
@@ -166,7 +173,7 @@ def _project_pay(answers: dict) -> dict:
         mode = proxy.get("mode")
         if mode == "webshare" and proxy.get("api_key"):
             gost_port = int(proxy.get("gost_listen_port", 18898))
-            out["webshare"] = {
+            webshare = {
                 "enabled": True,
                 "api_key": proxy["api_key"],
                 "lock_country": proxy.get("lock_country", "US"),
@@ -177,6 +184,16 @@ def _project_pay(answers: dict) -> dict:
                 "gost_listen_port": gost_port,
                 "sync_team_proxy": proxy.get("sync_team_proxy", True),
             }
+            if proxy.get("api_proxy"):
+                webshare["api_proxy"] = str(proxy["api_proxy"]).strip()
+            if proxy.get("gost_chain_proxy"):
+                webshare["gost_chain_proxy"] = str(proxy["gost_chain_proxy"]).strip()
+            if isinstance(proxy.get("manual_proxy"), dict):
+                webshare["manual_proxy"] = proxy["manual_proxy"]
+            existing_last = ((_existing_pay_config().get("webshare") or {}).get("last_proxy") or {})
+            if existing_last:
+                webshare["last_proxy"] = existing_last
+            out["webshare"] = webshare
             # webshare 模式下 pipeline._ensure_gost_alive 会拉起本地 gost 中继；
             # card.py 直接连这个地址出网（避开 example 模板透传的 USER:PASS 占位）
             # socks5h:// 让 DNS 在代理端解析，避免本地 DNS 解析失败

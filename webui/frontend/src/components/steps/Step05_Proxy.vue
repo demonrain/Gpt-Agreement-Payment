@@ -62,6 +62,8 @@
         <TermField v-model.number="form.zone_rotate_on_reg_fails" label="切 zone 注册失败数 · zone_rotate_on_reg_fails" type="number" placeholder="3 (连续 N 次注册失败切 zone)" />
         <TermField v-model.number="form.no_rotation_cooldown_s" label="配额冷却秒数 · no_rotation_cooldown_s" type="number" placeholder="10800 (配额耗尽冷却秒数)" />
         <TermField v-model.number="form.gost_listen_port" label="gost 中继端口 · gost_listen_port" type="number" placeholder="18898 (本地 gost 中继端口)" />
+        <TermField v-model="form.api_proxy" label="Webshare API 访问代理 · api_proxy" placeholder="http://127.0.0.1:7897 (仅用于查询 Webshare API)" />
+        <TermField v-model="form.gost_chain_proxy" label="gost 链式代理 · gost_chain_proxy" placeholder="http://192.168.0.2:7897 (仅用于 WSL 连接 Webshare upstream)" />
         <label class="toggle-row">
           <input type="checkbox" v-model="form.sync_team_proxy" />
           <span>换 IP 后同步 gpt-team 全局代理 (sync_team_proxy)</span>
@@ -108,6 +110,8 @@ const form = ref({
   zone_rotate_on_reg_fails: init.zone_rotate_on_reg_fails ?? 3,
   no_rotation_cooldown_s: init.no_rotation_cooldown_s ?? 10800,
   gost_listen_port: init.gost_listen_port ?? 18898,
+  api_proxy: init.api_proxy ?? "",
+  gost_chain_proxy: init.gost_chain_proxy ?? "",
   sync_team_proxy: init.sync_team_proxy ?? true,
 });
 const loading = ref(false);
@@ -138,7 +142,10 @@ async function testWebshare() {
   await store.saveToServer();
   loading.value = true;
   try {
-    result.value = await store.runPreflight("webshare", { api_key: form.value.api_key });
+    result.value = await store.runPreflight("webshare", {
+      api_key: form.value.api_key,
+      api_proxy: form.value.api_proxy,
+    });
   } finally { loading.value = false; }
 }
 

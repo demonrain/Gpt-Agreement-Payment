@@ -573,6 +573,34 @@ class GoPayCharger:
 
     # ───── Step 7: Midtrans linking initiation ─────
 
+    def _midtrans_linking_ref_from_response(self, r: Any, *, label: str = "linking") -> str:
+        data = r.json()
+        m = re.search(r"reference=([a-f0-9-]{36})", data.get("activation_link_url", ""))
+        if not m:
+            raise GoPayError(f"midtrans {label} 201 but no reference: {data}")
+        ref = m.group(1)
+        self.log(f"[gopay] midtrans {label} ok reference={ref}")
+        return ref
+
+    def _midtrans_init_linking_without_auth(
+        self,
+        url: str,
+        body: dict,
+        snap_token: str,
+    ) -> Optional[str]:
+        headers = {
+            "Content-Type": "application/json",
+            "Origin": "https://app.midtrans.com",
+            "Referer": f"https://app.midtrans.com/snap/v4/redirection/{snap_token}",
+        }
+        r = self.mt.post(url, json=body, headers=headers, timeout=DEFAULT_TIMEOUT)
+        if r.status_code == 201:
+            return self._midtrans_linking_ref_from_response(r, label="linking no-auth")
+        self.log(
+            f"[gopay] midtrans linking no-auth fallback status={r.status_code}",
+        )
+        return None
+
     def _midtrans_init_linking(self, snap_token: str) -> str:
         """POST snap/v3/accounts/{snap}/linking. Retries on 406."""
         url = f"https://app.midtrans.com/snap/v3/accounts/{snap_token}/linking"
@@ -590,18 +618,19 @@ class GoPayCharger:
         last_err: Optional[str] = None
         retries_406 = 0
         retries_429 = 0
+        tried_no_auth = False
         max_total = LINK_RETRY_LIMIT + LINK_429_RETRY_LIMIT + 1
         for _ in range(max_total):
             r = self.mt.post(url, json=body, headers=headers, timeout=DEFAULT_TIMEOUT)
             if r.status_code == 201:
-                data = r.json()
-                m = re.search(r"reference=([a-f0-9-]{36})", data.get("activation_link_url", ""))
-                if not m:
-                    raise GoPayError(f"midtrans linking 201 but no reference: {data}")
-                ref = m.group(1)
-                self.log(f"[gopay] midtrans linking ok reference={ref}")
-                return ref
+                return self._midtrans_linking_ref_from_response(r)
             if r.status_code == 429:
+                if not tried_no_auth:
+                    tried_no_auth = True
+                    self.log("[gopay] midtrans linking 429, retrying once without Authorization")
+                    ref = self._midtrans_init_linking_without_auth(url, body, snap_token)
+                    if ref:
+                        return ref
                 retries_429 += 1
                 if retries_429 > LINK_429_RETRY_LIMIT:
                     raise GoPayError(f"midtrans linking 429 exhausted {LINK_429_RETRY_LIMIT} retries")

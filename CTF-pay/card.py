@@ -5054,6 +5054,44 @@ def _safe_screenshot(page, path: str):
         pass
 
 
+def _rt_open_authorize_page(page, auth_url: str, attempts: int = 3,
+                            log_func=None, sleep_func=None) -> bool:
+    """Open Codex authorize URL and recover from transient blank-page resets."""
+    log = log_func or _log
+    sleep = sleep_func or time.sleep
+    attempts = max(1, int(attempts or 1))
+    last_error = ""
+
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            log(f"      [RT] 重新打开 Codex authorize URL ({attempt}/{attempts}) ...")
+        try:
+            page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e_nav:
+            last_error = str(e_nav)
+            log(f"      [RT] goto 异常({attempt}/{attempts}): {last_error[:160]}")
+
+        sleep(2 if attempt == 1 else 3)
+        current_url = (getattr(page, "url", "") or "")[:200]
+        log(f"      [RT] 当前 URL({attempt}/{attempts}): {current_url}")
+
+        if current_url and not current_url.startswith("about:blank"):
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+            return True
+
+        if attempt < attempts:
+            sleep(1)
+
+    if last_error:
+        log(f"      [RT] authorize URL 打开失败，最后异常: {last_error[:160]}")
+    else:
+        log("      [RT] authorize URL 打开失败，页面仍停留在 about:blank")
+    return False
+
+
 def _fetch_openai_login_otp(target_email: str, timeout: int = 180) -> str:
     """从 CF KV 取 OpenAI 登录 OTP（worker 已替代 IMAP→QQ 转发链路）。
 
@@ -5201,12 +5239,9 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
 
             # [1] goto Codex authorize → 触发登录
             _log("      [RT] 打开 Codex authorize URL ...")
-            try:
-                page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
-            except Exception as e_nav:
-                _log(f"      [RT] goto 异常: {str(e_nav)[:120]}")
-            time.sleep(3)
-            _log(f"      [RT] 当前 URL: {page.url[:120]}")
+            if not _rt_open_authorize_page(page, auth_url):
+                _safe_screenshot(page, "/tmp/rt_authorize_blank.png")
+                return ""
 
             # [2] 填邮箱
             try:

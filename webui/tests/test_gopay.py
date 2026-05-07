@@ -248,6 +248,34 @@ def test_linking_406_exhaustion_raises():
         charger.run(stripe_pk=STRIPE_PK)
 
 
+@responses.activate
+def test_linking_429_falls_back_without_authorization(monkeypatch):
+    monkeypatch.setattr(gopay.time, "sleep", lambda _s: None)
+    url = f"https://app.midtrans.com/snap/v3/accounts/{SNAP_TOKEN}/linking"
+
+    def request_callback(request):
+        if "Authorization" in request.headers:
+            return (429, {"Retry-After": "0"}, '{"error":"too many requests"}')
+        return (
+            201,
+            {"Content-Type": "application/json"},
+            (
+                '{"status_code":"201","activation_link_url":'
+                f'"https://merchants-gws-app.gopayapi.com/app/authorize?reference={LINK_REF}&target=gwc"'
+                "}"
+            ),
+        )
+
+    responses.add_callback(responses.POST, url, callback=request_callback)
+
+    charger = build_charger()
+
+    assert charger._midtrans_init_linking(SNAP_TOKEN) == LINK_REF
+    assert len(responses.calls) == 2
+    assert "Authorization" in responses.calls[0].request.headers
+    assert "Authorization" not in responses.calls[1].request.headers
+
+
 # ────────────────── OTP cancel ──────────────────
 
 
