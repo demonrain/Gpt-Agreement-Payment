@@ -102,6 +102,10 @@ class GoPayPINRejected(GoPayError):
     pass
 
 
+class GoPayOTPRejected(GoPayError):
+    pass
+
+
 # ──────────────────────────── core ────────────────────────────────
 
 
@@ -707,9 +711,13 @@ class GoPayCharger:
         )
         if r.status_code != 200:
             self.log(f"[gopay] validate-otp failed: status={r.status_code} body={r.text[:500]}")
+            if self._is_retryable_otp_response(r):
+                raise GoPayOTPRejected(f"OTP rejected by GoPay: {r.text[:200]}")
         r.raise_for_status()
         data = r.json()
         if not data.get("success"):
+            if self._is_retryable_otp_payload(data):
+                raise GoPayOTPRejected(f"OTP rejected by GoPay: {data}")
             raise GoPayError(f"validate-otp failed: {data}")
         challenge = (
             data.get("data", {}).get("challenge", {}).get("action", {}).get("value", {})
@@ -720,6 +728,23 @@ class GoPayCharger:
             raise GoPayError(f"validate-otp: missing challenge details {data}")
         self.log(f"[gopay] otp ok challenge_id={challenge_id[:8]}…")
         return challenge_id, client_id
+
+    @staticmethod
+    def _is_retryable_otp_payload(data: dict) -> bool:
+        for err in data.get("errors") or []:
+            if not isinstance(err, dict):
+                continue
+            code = str(err.get("code") or "")
+            if code == "GoPay-1604" or err.get("is_retryable") is True:
+                return True
+        return False
+
+    def _is_retryable_otp_response(self, response: Any) -> bool:
+        try:
+            data = response.json()
+        except Exception:
+            return False
+        return isinstance(data, dict) and self._is_retryable_otp_payload(data)
 
     def _tokenize_pin(self, challenge_id: str, client_id: str) -> str:
         """POST customer.gopayapi.com/api/v1/users/pin/tokens/nb → JWT."""
@@ -893,11 +918,32 @@ class GoPayCharger:
 
         # ── Linking: OTP + first PIN
         self._gopay_validate_reference(reference_id)
+        prepare = getattr(self.otp_provider, "prepare", None)
+        if callable(prepare):
+            try:
+                prepare()
+            except Exception as e:
+                self.log(f"[gopay] OTP provider prepare failed, continuing: {e}")
         self._gopay_user_consent(reference_id)
-        otp = self.otp_provider()
-        if not otp:
-            raise OTPCancelled("OTP not provided")
-        challenge_id, client_id = self._gopay_validate_otp(reference_id, otp)
+        otp_retries = max(1, _int_cfg(self._gopay_cfg, "otp_validate_retries", 3))
+        last_otp_error = None
+        for otp_attempt in range(1, otp_retries + 1):
+            otp = self.otp_provider()
+            if not otp:
+                raise OTPCancelled("OTP not provided")
+            try:
+                challenge_id, client_id = self._gopay_validate_otp(reference_id, otp)
+                break
+            except GoPayOTPRejected as e:
+                last_otp_error = e
+                if otp_attempt >= otp_retries:
+                    raise
+                self.log(
+                    f"[gopay] OTP rejected by GoPay, waiting for a new OTP "
+                    f"({otp_attempt}/{otp_retries})"
+                )
+        else:
+            raise GoPayOTPRejected(str(last_otp_error or "OTP rejected by GoPay"))
         pin_token = self._tokenize_pin(challenge_id, client_id)
         self._gopay_validate_pin(reference_id, pin_token)
 
@@ -1124,6 +1170,13 @@ def _extract_otp_from_payload(
 def _float_cfg(cfg: dict, key: str, default: float) -> float:
     try:
         return float(cfg.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_cfg(cfg: dict, key: str, default: int) -> int:
+    try:
+        return int(cfg.get(key, default))
     except (TypeError, ValueError):
         return default
 

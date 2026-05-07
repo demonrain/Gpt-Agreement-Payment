@@ -1011,6 +1011,8 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
                           f" {str(e)[:120]}")
                     try:
                         _rotate_webshare_ip(card_cfg)
+                        if not _ensure_gost_alive(card_cfg, team_client, cfg_path=card_config_path):
+                            raise RuntimeError("gost 本地中继出口仍不可用")
                         print("[pipeline] 已轮换 Webshare 出口 IP")
                     except Exception as rot_e:
                         print(f"[pipeline] IP 轮换跳过: {rot_e}")
@@ -1492,6 +1494,8 @@ def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
                       f" {str(e)[:120]}")
                 try:
                     _rotate_webshare_ip(card_cfg)
+                    if not _ensure_gost_alive(card_cfg):
+                        raise RuntimeError("gost 本地中继出口仍不可用")
                     print("[pay-only] 已轮换 Webshare 出口 IP")
                 except Exception as rot_e:
                     print(f"[pay-only] IP 轮换跳过: {rot_e}")
@@ -2445,6 +2449,10 @@ _PROXY_IP_ENDPOINTS = (
     "https://checkip.amazonaws.com",
     "https://icanhazip.com",
 )
+_GOST_PAYMENT_HEALTH_ENDPOINTS = (
+    "https://m.stripe.com/6",
+    "https://api.stripe.com/",
+)
 
 
 def _detect_windows_host_ip() -> str:
@@ -2693,6 +2701,11 @@ def _swap_gost_relay(new_ip: str, new_port: int, username: str, password: str,
         time.sleep(0.3)
 
     upstream = f"{upstream_scheme}://{username}:{password}@{new_ip}:{new_port}"
+    safe_upstream = (
+        f"{upstream_scheme}://{username}:<redacted>@{new_ip}:{new_port}"
+        if username
+        else f"{upstream_scheme}://{new_ip}:{new_port}"
+    )
     http_port = listen_port + 1
     cmd = ["gost", f"-L=socks5://:{listen_port}", f"-L=http://:{http_port}"]
     local_proxy = str(chain_proxy or "").strip() or _resolve_outbound_proxy()
@@ -2710,7 +2723,7 @@ def _swap_gost_relay(new_ip: str, new_port: int, username: str, password: str,
     time.sleep(1.5)
     if p.poll() is not None:
         raise RuntimeError(f"gost 启动即退出，见 {log_path}")
-    print(f"[gost] 启动新中继 PID={p.pid}  {upstream}")
+    print(f"[gost] 启动新中继 PID={p.pid}  {safe_upstream}")
 
 
 _COUNTRY_ALIAS = {"UK": "GB", "USA": "US", "KR": "KR", "JP": "JP"}
@@ -2735,6 +2748,21 @@ def _local_gost_egress_ok(listen_port: int) -> bool:
                 r = _req.get(api, proxies=proxies, timeout=timeout_s, verify=False)
                 r.raise_for_status()
                 if r.text.strip():
+                    break
+            except Exception as e:
+                last_err = e
+                continue
+        else:
+            if last_err:
+                print(f"[gost] 本地中继出口探测失败: {type(last_err).__name__}: {last_err}")
+            else:
+                print("[gost] 本地中继出口探测失败: no response")
+            return False
+        payment_timeout_s = float(os.environ.get("PROXY_PAYMENT_LOOKUP_TIMEOUT", "8") or 8)
+        for api in _GOST_PAYMENT_HEALTH_ENDPOINTS:
+            try:
+                r = _req.get(api, proxies=proxies, timeout=payment_timeout_s, verify=False)
+                if getattr(r, "status_code", 200) < 500:
                     return True
             except Exception as e:
                 last_err = e
@@ -2745,6 +2773,18 @@ def _local_gost_egress_ok(listen_port: int) -> bool:
         print(f"[gost] 本地中继出口探测失败: {type(last_err).__name__}: {last_err}")
     else:
         print("[gost] 本地中继出口探测失败: no response")
+    return False
+
+
+def _wait_local_gost_egress_ok(listen_port: int, retries: int = 3, interval_s: float = 2.0) -> bool:
+    retries = max(1, int(retries or 1))
+    interval_s = max(0.0, float(interval_s or 0.0))
+    for attempt in range(1, retries + 1):
+        if _local_gost_egress_ok(listen_port):
+            return True
+        if attempt < retries:
+            print(f"[gost] 本地中继出口未就绪，{interval_s:g}s 后重试 ({attempt}/{retries})")
+            time.sleep(interval_s)
     return False
 
 
@@ -2908,6 +2948,11 @@ def _ensure_gost_alive(card_cfg: dict, team_client=None, cfg_path: str | Path | 
     except Exception as e:
         print(f"[gost] 拉起失败: {e}")
         return False
+    health_retries = int(ws_cfg.get("gost_health_retries") or 3)
+    health_interval = float(ws_cfg.get("gost_health_interval_s") or 2)
+    if not _wait_local_gost_egress_ok(listen_port, health_retries, health_interval):
+        print(f"[gost] 拉起后出口仍不可用，跳过本次代理")
+        return False
     print(f"[gost] 代理国家={px.get('country_code', '?')} "
           f"upstream={proxy_host}:{proxy_port}")
     # 同步 team 全局代理
@@ -2997,6 +3042,10 @@ def _rotate_webshare_ip(card_cfg: dict, team_client=None, prev_ip: str = "") -> 
     _swap_gost_relay(new_host, new_port, user, pw,
                       listen_port=listen_port, upstream_scheme=upstream_scheme,
                       chain_proxy=str(ws_cfg.get("gost_chain_proxy") or ""))
+    health_retries = int(ws_cfg.get("gost_health_retries") or 3)
+    health_interval = float(ws_cfg.get("gost_health_interval_s") or 2)
+    if not _wait_local_gost_egress_ok(listen_port, health_retries, health_interval):
+        raise RuntimeError(f"gost 本地中继出口不可用 listen_port={listen_port}")
 
     if sync_team and team_client:
         team_url = f"{team_scheme}://{user}:{pw}@{new_host}:{new_port}"

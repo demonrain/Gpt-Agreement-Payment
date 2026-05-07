@@ -126,6 +126,40 @@ def test_pay_only_success_imports_cpa_with_plus_tag(tmp_path, monkeypatch):
     assert rows[-1]["cpa_import"] == "ok"
 
 
+def test_pay_only_ensures_gost_after_rotation_before_retry(tmp_path, monkeypatch):
+    db = _reset_db(tmp_path, monkeypatch)
+    card_config = tmp_path / "config.paypal.json"
+
+    db.add_registered_account({
+        "email": "retry@example.com",
+        "session_token": "sess-retry",
+        "access_token": "at-retry",
+        "device_id": "dev-retry",
+    })
+    card_config.write_text(json.dumps({
+        "webshare": {"enabled": True, "api_key": "secret"},
+    }), encoding="utf-8")
+
+    events = []
+
+    def fake_pay(*args, **kwargs):
+        events.append("pay")
+        if events.count("pay") == 1:
+            raise pipeline.PaymentError("network failed")
+        return {"status": "succeeded", "raw": {"session_id": "cs_test"}}
+
+    monkeypatch.setattr(pipeline, "pay", fake_pay)
+    monkeypatch.setattr(pipeline, "_rotate_webshare_ip", lambda cfg: events.append("rotate") or {"proxy_address": "proxy.example"})
+    monkeypatch.setattr(pipeline, "_ensure_gost_alive", lambda cfg, **kwargs: events.append("ensure") or True)
+    monkeypatch.setattr(pipeline, "_cpa_import_after_team", lambda *args, **kwargs: "skipped")
+    monkeypatch.setattr(pipeline.time, "sleep", lambda _s: None)
+
+    result = pipeline.pay_only(str(card_config), use_gopay=True)
+
+    assert result["status"] == "succeeded"
+    assert events[:4] == ["pay", "rotate", "ensure", "pay"]
+
+
 def test_cpa_import_falls_back_to_access_token_without_refresh_token(tmp_path, monkeypatch):
     db = _reset_db(tmp_path, monkeypatch)
     db.add_registered_account({

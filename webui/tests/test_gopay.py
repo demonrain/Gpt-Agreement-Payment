@@ -280,6 +280,64 @@ def test_linking_429_falls_back_without_authorization(monkeypatch):
 
 
 @responses.activate
+def test_validate_otp_retryable_error_raises_rejected():
+    responses.post(
+        "https://gwa.gopayapi.com/v1/linking/validate-otp",
+        json={
+            "success": False,
+            "errors": [{
+                "code": "GoPay-1604",
+                "message_title": "Kode OTP-nya salah.",
+                "is_retryable": True,
+            }],
+        },
+        status=400,
+    )
+
+    charger = build_charger(otp_value="111111")
+    with pytest.raises(gopay.GoPayOTPRejected):
+        charger._gopay_validate_otp(LINK_REF, "111111")
+
+
+def test_run_midtrans_retries_after_retryable_otp_rejection(monkeypatch):
+    provided = iter(["111111", "222222"])
+    validated = []
+
+    charger = build_charger()
+    charger.otp_provider = lambda: next(provided)
+    charger._gopay_cfg["otp_validate_retries"] = 2
+
+    monkeypatch.setattr(charger, "_midtrans_load_transaction", lambda snap: None)
+    monkeypatch.setattr(charger, "_midtrans_init_linking", lambda snap: LINK_REF)
+    monkeypatch.setattr(charger, "_gopay_validate_reference", lambda ref: None)
+    monkeypatch.setattr(charger, "_gopay_user_consent", lambda ref: None)
+    monkeypatch.setattr(charger, "_tokenize_pin", lambda challenge_id, client_id: PIN_JWT_LINK)
+    monkeypatch.setattr(charger, "_gopay_validate_pin", lambda ref, token: None)
+    monkeypatch.setattr(charger, "_midtrans_create_charge", lambda snap: CHARGE_REF)
+    monkeypatch.setattr(charger, "_gopay_payment_validate", lambda ref: None)
+    monkeypatch.setattr(
+        charger,
+        "_gopay_payment_confirm",
+        lambda ref: (CHALLENGE_ID2, gopay.GOPAY_PIN_CLIENT_ID_CHARGE),
+    )
+    monkeypatch.setattr(charger, "_gopay_payment_process", lambda ref, token: None)
+    monkeypatch.setattr(charger, "_try_auto_unlink", lambda: None)
+
+    def fake_validate_otp(reference_id, otp):
+        validated.append(otp)
+        if otp == "111111":
+            raise gopay.GoPayOTPRejected("retryable")
+        return CHALLENGE_ID, gopay.GOPAY_PIN_CLIENT_ID_LINK
+
+    monkeypatch.setattr(charger, "_gopay_validate_otp", fake_validate_otp)
+
+    result = charger._run_midtrans_and_gopay(SNAP_TOKEN, cs_id="")
+
+    assert result["state"] == "succeeded"
+    assert validated == ["111111", "222222"]
+
+
+@responses.activate
 def test_otp_provider_cancel_raises():
     responses.post("https://chatgpt.com/backend-api/payments/checkout", json={"id": CS_ID, "session_id": CS_ID})
     responses.post("https://api.stripe.com/v1/payment_methods", json={"id": PM_ID})

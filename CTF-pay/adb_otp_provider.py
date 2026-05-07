@@ -86,21 +86,27 @@ def _extract_wa_otp_from_dump(dump: str, skip: set[str] | None = None) -> Option
     wa_blocks = _collect_wa_blocks(dump)
 
     # --- 第一轮：强匹配（同一块内含 "gopay" + 6 位数字） ---
+    candidates: list[str] = []
     for block in wa_blocks:
         block_text = "\n".join(block)
         if not _GOPAY_KW.search(block_text):
             continue
         for m in _DEFAULT_OTP_RE.finditer(block_text):
             if m.group(1) not in _skip:
-                return m.group(1)
+                candidates.append(m.group(1))
+    if candidates:
+        return candidates[-1]
 
     # --- 第二轮：弱匹配（同一行含通用 OTP 关键词 + 6 位数字） ---
+    candidates = []
     for block in wa_blocks:
         for line in block:
             if _OTP_KW.search(line):
                 for m in _DEFAULT_OTP_RE.finditer(line):
                     if m.group(1) not in _skip:
-                        return m.group(1)
+                        candidates.append(m.group(1))
+    if candidates:
+        return candidates[-1]
 
     return None
 
@@ -211,6 +217,7 @@ def adb_otp_provider(
     serial: str = "emulator-5554",
     timeout: float = 300.0,
     interval: float = 3.0,
+    pre_scan: bool = True,
     log: Callable[[str], None] = print,
 ) -> Callable[[], str]:
     """工厂函数: 返回一个阻塞式 Callable，轮询 ADB 获取 WhatsApp OTP。
@@ -223,34 +230,54 @@ def adb_otp_provider(
       5. 两种策略交替执行直到超时
     """
 
-    def provider() -> str:
-        log(f"[gopay] waiting WhatsApp OTP from ADB device: {serial}")
+    seen: set[str] = set()
+    ui_seen: set[str] = set()
+    prepared = False
 
+    def prepare() -> None:
+        nonlocal prepared
         if not _verify_device(serial, log):
             raise RuntimeError(f"ADB device {serial} unreachable, abort OTP polling")
 
         _press_home(serial)
         time.sleep(0.5)
 
-        seen: set[str] = set()
         log("[gopay] ADB: pre-scanning notifications...")
         pre_dump = _dump_notifications(serial)
         if pre_dump:
             seen.update(_extract_all_wa_otps_from_dump(pre_dump))
         _dismiss_wa_notifications(serial)
+        pre_xml = _dump_whatsapp_ui(serial)
+        if pre_xml:
+            for m in _DEFAULT_OTP_RE.finditer(pre_xml):
+                ui_seen.add(m.group(1))
         if seen:
             log(f"[gopay] ADB: marked {len(seen)} old OTP(s), cleared notifications")
+        if ui_seen:
+            log(f"[gopay] ADB: marked {len(ui_seen)} old UI OTP(s)")
+        prepared = True
+
+    def provider() -> str:
+        log(f"[gopay] waiting WhatsApp OTP from ADB device: {serial}")
+
+        if pre_scan and not prepared:
+            prepare()
+        else:
+            if not _verify_device(serial, log):
+                raise RuntimeError(f"ADB device {serial} unreachable, abort OTP polling")
+            _press_home(serial)
+            time.sleep(0.5)
+
         log("[gopay] ADB: polling started")
 
         deadline = time.time() + timeout
         notify_miss = 0
-        ui_baseline_done = False
-        ui_seen: set[str] = set()
 
         while time.time() < deadline:
             dump = _dump_notifications(serial)
             otp = _extract_wa_otp_from_dump(dump, skip=seen) if dump else None
             if otp:
+                seen.add(otp)
                 log(f"[gopay] ADB: OTP={otp} (from notification)")
                 _dismiss_wa_notifications(serial)
                 return otp
@@ -260,17 +287,13 @@ def adb_otp_provider(
             if notify_miss >= _UI_FALLBACK_AFTER:
                 xml = _dump_whatsapp_ui(serial)
                 if xml:
-                    if not ui_baseline_done:
-                        for m in _DEFAULT_OTP_RE.finditer(xml):
-                            ui_seen.add(m.group(1))
-                        ui_baseline_done = True
-                        log(f"[gopay] ADB: UI baseline captured ({len(ui_seen)} codes)")
-                    else:
-                        all_skip = seen | ui_seen
-                        otp = _extract_otp_from_ui_xml(xml, skip=all_skip)
-                        if otp:
-                            log(f"[gopay] ADB: OTP={otp} (from UI dump)")
-                            return otp
+                    all_skip = seen | ui_seen
+                    otp = _extract_otp_from_ui_xml(xml, skip=all_skip)
+                    if otp:
+                        seen.add(otp)
+                        ui_seen.add(otp)
+                        log(f"[gopay] ADB: OTP={otp} (from UI dump)")
+                        return otp
 
             remaining = int(deadline - time.time())
             if notify_miss > 0 and notify_miss % 20 == 0:
@@ -280,4 +303,5 @@ def adb_otp_provider(
 
         raise TimeoutError(f"ADB WhatsApp OTP timeout after {timeout}s (device={serial})")
 
+    setattr(provider, "prepare", prepare)
     return provider

@@ -122,6 +122,24 @@ def _tap_node(serial: str, node: dict, log: Callable, label: str) -> None:
     _tap(serial, node["x"], node["y"])
 
 
+def _find_openai_linked(xml: str) -> dict | None:
+    return _find_by_desc(xml, re.compile(r"(?i)openai|open\s*ai|chatgpt"))
+
+
+def _find_unlink_button(xml: str) -> dict | None:
+    btn = _find_node(xml, **{
+        "content-desc": re.compile(r"(?i)^unlink$"),
+        "class": "android.widget.Button",
+    })
+    if btn:
+        return btn
+    return _find_by_desc(xml, re.compile(r"(?i)^unlink$|unlink"))
+
+
+def _find_no_linked_apps(xml: str) -> dict | None:
+    return _find_by_desc(xml, re.compile(r"(?i)no\s*app.*linked|no\s*linked\s*app"))
+
+
 def gopay_unlink_openai(
     serial: str = "emulator-5554",
     timeout: float = 60.0,
@@ -212,59 +230,78 @@ def gopay_unlink_openai(
         _back(serial)
         return {"ok": True, "message": "已关联应用列表中未找到 OpenAI（已解绑或从未关联）"}
 
-    # Step 6: 找到 OpenAI 条目旁的 Unlink 按钮
-    # GoPay UI 中 Unlink 按钮是 OpenAI 条目内的子按钮
-    unlink_btn = _find_node(xml, **{
-        "content-desc": re.compile(r"(?i)^unlink$"),
-        "class": "android.widget.Button",
-    })
-    if not unlink_btn:
-        # 回退：直接点击 OpenAI 条目
-        _tap_node(serial, openai_node, log, "OpenAI 条目")
+    attempts = 0
+    last_descs: list[str] = []
+    for attempt in range(1, 4):
+        attempts = attempt
+        log(f"[unlink] unlink 尝试 {attempt}/3")
+        openai_node = _find_openai_linked(xml)
+        if not openai_node:
+            _back(serial)
+            _back(serial)
+            log("[unlink] GoPay OpenAI unlink 成功")
+            return {"ok": True, "message": "GoPay 已成功取消 OpenAI 关联", "attempts": attempt - 1}
+
+        # Step 6: 找到 OpenAI 条目旁的 Unlink 按钮。找不到时先点 OpenAI 条目进入详情页。
+        unlink_btn = _find_unlink_button(xml)
+        if not unlink_btn:
+            _tap_node(serial, openai_node, log, "OpenAI 条目")
+            time.sleep(2)
+            xml = _dump_ui(serial)
+            unlink_btn = _find_unlink_button(xml)
+
+        if not unlink_btn:
+            last_descs = _dump_all_descs(xml)
+            log(f"[unlink] 未找到 Unlink 按钮，当前页面元素: {last_descs[:10]}")
+            break
+
+        _tap_node(serial, unlink_btn, log, "Unlink")
         time.sleep(2)
+
+        # Step 7: 确认弹窗 — 查找确认 Unlink 按钮
         xml = _dump_ui(serial)
-        unlink_btn = _find_by_desc(xml, re.compile(r"(?i)unlink"))
-
-    if not unlink_btn:
-        log("[unlink] 未找到 Unlink 按钮")
-        _back(serial)
-        _back(serial)
-        return {"ok": False, "message": "找到 OpenAI 条目但未找到 Unlink 按钮"}
-
-    _tap_node(serial, unlink_btn, log, "Unlink")
-    time.sleep(2)
-
-    # Step 7: 确认弹窗 — 查找确认 Unlink 按钮
-    xml = _dump_ui(serial)
-    confirm_dialog = _find_by_desc(xml, re.compile(r"(?i)unlink.*from.*gopay"))
-    if confirm_dialog:
-        # 确认弹窗出现，点击底部的 Unlink 确认按钮
-        confirm_btn = _find_node(xml, **{
-            "content-desc": re.compile(r"(?i)^unlink$"),
-            "class": "android.widget.Button",
-        })
-        if confirm_btn:
-            _tap_node(serial, confirm_btn, log, "确认 Unlink")
-            time.sleep(3)
+        confirm_dialog = _find_by_desc(xml, re.compile(r"(?i)unlink.*from.*gopay"))
+        if confirm_dialog:
+            confirm_btn = _find_unlink_button(xml)
+            if confirm_btn:
+                _tap_node(serial, confirm_btn, log, "确认 Unlink")
+                time.sleep(5)
+            else:
+                last_descs = _dump_all_descs(xml)
+                log(f"[unlink] 确认弹窗出现但未找到确认按钮，元素: {last_descs[:10]}")
+                _back(serial)
+                time.sleep(1)
         else:
-            log("[unlink] 确认弹窗出现但未找到确认按钮")
-            _back(serial)
-            _back(serial)
-            return {"ok": False, "message": "确认弹窗出现但未找到确认按钮"}
-    else:
-        log("[unlink] 未出现确认弹窗，可能已直接解绑")
+            log("[unlink] 未出现确认弹窗，可能已直接解绑")
+            time.sleep(3)
 
-    # Step 8: 验证结果
-    xml = _dump_ui(serial)
-    no_apps = _find_by_desc(xml, re.compile(r"(?i)no\s*app.*linked"))
-    still_linked = _find_by_desc(xml, re.compile(r"(?i)openai|open\s*ai"))
-    if no_apps or not still_linked:
+        # Step 8: 验证结果。GoPay 有时异步更新，短轮询再判定。
+        verify_deadline = time.time() + 12
+        while time.time() < verify_deadline:
+            xml = _dump_ui(serial)
+            if _find_no_linked_apps(xml) or not _find_openai_linked(xml):
+                _back(serial)
+                _back(serial)
+                log("[unlink] GoPay OpenAI unlink 成功")
+                return {"ok": True, "message": "GoPay 已成功取消 OpenAI 关联", "attempts": attempt}
+            time.sleep(2)
+
+        last_descs = _dump_all_descs(xml)
+        log(f"[unlink] 第 {attempt}/3 次解绑后 OpenAI 仍在列表中，准备兜底重试")
+        # 回到列表/刷新当前页面，避免卡在详情页或旧弹窗。
         _back(serial)
-        _back(serial)
-        log("[unlink] GoPay OpenAI unlink 成功")
-        return {"ok": True, "message": "GoPay 已成功取消 OpenAI 关联"}
+        time.sleep(1)
+        xml = _dump_ui(serial)
+        if not _find_openai_linked(xml):
+            _back(serial)
+            xml = _dump_ui(serial)
 
     log("[unlink] 解绑后 OpenAI 仍在列表中，可能未成功")
     _back(serial)
     _back(serial)
-    return {"ok": False, "message": "执行了 Unlink 操作但 OpenAI 仍在列表中"}
+    return {
+        "ok": False,
+        "message": "执行了 Unlink 操作但 OpenAI 仍在列表中",
+        "attempts": attempts,
+        "debug_descs": last_descs[:10],
+    }

@@ -3,6 +3,7 @@ import json
 import uuid
 from pathlib import Path
 
+import pytest
 import requests
 
 import pipeline
@@ -94,6 +95,7 @@ def test_pipeline_ensure_gost_uses_cached_proxy_when_webshare_times_out(monkeypa
         "_swap_gost_relay",
         lambda *args, **kwargs: calls.append(("swap", args, kwargs)),
     )
+    monkeypatch.setattr(pipeline, "_wait_local_gost_egress_ok", lambda *args, **kwargs: True)
 
     assert pipeline._ensure_gost_alive({
         "webshare": {
@@ -133,6 +135,7 @@ def test_pipeline_ensure_gost_prefers_manual_proxy_without_webshare_lookup(monke
         "_swap_gost_relay",
         lambda *args, **kwargs: calls.append(("swap", args, kwargs)),
     )
+    monkeypatch.setattr(pipeline, "_wait_local_gost_egress_ok", lambda *args, **kwargs: True)
 
     assert pipeline._ensure_gost_alive({
         "webshare": {
@@ -197,6 +200,40 @@ def test_swap_gost_relay_prefers_configured_chain_proxy(monkeypatch):
     )
 
 
+def test_swap_gost_relay_does_not_log_proxy_password(monkeypatch, capsys):
+    class FakeProc:
+        pid = 1234
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(pipeline.subprocess, "check_output", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        pipeline.subprocess,
+        "run",
+        lambda *args, **kwargs: type("Result", (), {"stdout": ""})(),
+    )
+    monkeypatch.setattr(pipeline, "_resolve_outbound_proxy", lambda: "")
+    monkeypatch.setattr(pipeline.time, "sleep", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline.os, "open", lambda *args, **kwargs: 9)
+    monkeypatch.setattr(pipeline.os, "close", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline.subprocess, "Popen", lambda *args, **kwargs: FakeProc())
+
+    pipeline._swap_gost_relay(
+        "p.webshare.io",
+        10000,
+        "user",
+        "pass",
+        listen_port=18898,
+        upstream_scheme="http",
+    )
+
+    out = capsys.readouterr().out
+    assert "pass" not in out
+    assert "user:pass@" not in out
+    assert "p.webshare.io:10000" in out
+
+
 def test_pipeline_ensure_gost_persists_last_proxy_after_success(monkeypatch):
     cfg_path = _temp_config_path()
     cfg_path.write_text(json.dumps({
@@ -228,6 +265,7 @@ def test_pipeline_ensure_gost_persists_last_proxy_after_success(monkeypatch):
     )
     monkeypatch.setattr(pipeline, "WebshareClient", SuccessClient)
     monkeypatch.setattr(pipeline, "_swap_gost_relay", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "_wait_local_gost_egress_ok", lambda *args, **kwargs: True)
 
     card_cfg = pipeline._read_card_cfg(str(cfg_path))
     assert pipeline._ensure_gost_alive(card_cfg, cfg_path=str(cfg_path)) is True
@@ -287,6 +325,7 @@ def test_pipeline_ensure_gost_retries_webshare_api_via_detected_proxy_after_dire
         "_swap_gost_relay",
         lambda *args, **kwargs: calls.append(("swap", args, kwargs)),
     )
+    monkeypatch.setattr(pipeline, "_wait_local_gost_egress_ok", lambda *args, **kwargs: True)
 
     assert pipeline._ensure_gost_alive({
         "webshare": {
@@ -338,6 +377,7 @@ def test_pipeline_ensure_gost_does_not_probe_retry_proxy_when_direct_webshare_lo
         "_swap_gost_relay",
         lambda *args, **kwargs: calls.append(("swap", args, kwargs)),
     )
+    monkeypatch.setattr(pipeline, "_wait_local_gost_egress_ok", lambda *args, **kwargs: True)
 
     assert pipeline._ensure_gost_alive({
         "webshare": {
@@ -448,6 +488,7 @@ def test_pipeline_ensure_gost_restarts_existing_listener_when_egress_probe_fails
         "_swap_gost_relay",
         lambda *args, **kwargs: calls.append(("swap", args, kwargs)),
     )
+    monkeypatch.setattr(pipeline, "_wait_local_gost_egress_ok", lambda *args, **kwargs: True)
 
     assert pipeline._ensure_gost_alive({
         "webshare": {
@@ -479,6 +520,7 @@ def test_pipeline_ensure_gost_restarts_lock_country_listener_when_egress_probe_f
         "_swap_gost_relay",
         lambda *args, **kwargs: calls.append(("swap", args, kwargs)),
     )
+    monkeypatch.setattr(pipeline, "_wait_local_gost_egress_ok", lambda *args, **kwargs: True)
 
     assert pipeline._ensure_gost_alive({
         "webshare": {
@@ -521,6 +563,7 @@ def test_pipeline_ensure_gost_autodetects_chain_proxy_when_listener_is_broken(mo
         "_swap_gost_relay",
         lambda *args, **kwargs: calls.append(("swap", args, kwargs)),
     )
+    monkeypatch.setattr(pipeline, "_wait_local_gost_egress_ok", lambda *args, **kwargs: True)
 
     assert pipeline._ensure_gost_alive({
         "webshare": {
@@ -611,6 +654,7 @@ def test_rotate_webshare_ip_retries_api_via_detected_proxy_after_direct_timeout(
         "_swap_gost_relay",
         lambda *args, **kwargs: calls.append(("swap", args, kwargs)),
     )
+    monkeypatch.setattr(pipeline, "_wait_local_gost_egress_ok", lambda *args, **kwargs: True)
 
     px = pipeline._rotate_webshare_ip({
         "webshare": {
@@ -624,3 +668,90 @@ def test_rotate_webshare_ip_retries_api_via_detected_proxy_after_direct_timeout(
     assert ("client", "secret", 8, "") in calls
     assert ("client", "secret", 8, "http://192.168.0.88:7897") in calls
     assert calls[-1][0] == "swap"
+
+
+def test_rotate_webshare_ip_raises_when_relay_probe_fails(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def __init__(self, api_key, timeout_s=30, api_proxy="", **kwargs):
+            pass
+
+        def get_replacement_quota(self):
+            return {"total": 0, "used": 0, "available": 0}
+
+        def get_current_proxy(self):
+            return {
+                "proxy_address": "proxy.example",
+                "port": 8080,
+                "username": "user",
+                "password": "pass",
+                "country_code": "GB",
+                "valid": True,
+            }
+
+    monkeypatch.setattr(pipeline, "WebshareClient", FakeClient)
+    monkeypatch.setattr(
+        pipeline,
+        "_swap_gost_relay",
+        lambda *args, **kwargs: calls.append(("swap", args, kwargs)),
+    )
+    monkeypatch.setattr(pipeline, "_local_gost_egress_ok", lambda port: False)
+    monkeypatch.setattr(pipeline.time, "sleep", lambda _s: None)
+
+    with pytest.raises(RuntimeError, match="gost"):
+        pipeline._rotate_webshare_ip({
+            "webshare": {
+                "enabled": True,
+                "api_key": "secret",
+                "gost_listen_port": 18898,
+                "gost_health_retries": 1,
+                "gost_health_interval_s": 0,
+            },
+        })
+
+    assert calls and calls[-1][0] == "swap"
+
+
+def test_rotate_webshare_ip_retries_relay_probe_until_success(monkeypatch):
+    calls = []
+    health = iter([False, True])
+
+    class FakeClient:
+        def __init__(self, api_key, timeout_s=30, api_proxy="", **kwargs):
+            pass
+
+        def get_replacement_quota(self):
+            return {"total": 0, "used": 0, "available": 0}
+
+        def get_current_proxy(self):
+            return {
+                "proxy_address": "proxy.example",
+                "port": 8080,
+                "username": "user",
+                "password": "pass",
+                "country_code": "GB",
+                "valid": True,
+            }
+
+    monkeypatch.setattr(pipeline, "WebshareClient", FakeClient)
+    monkeypatch.setattr(
+        pipeline,
+        "_swap_gost_relay",
+        lambda *args, **kwargs: calls.append(("swap", args, kwargs)),
+    )
+    monkeypatch.setattr(pipeline, "_local_gost_egress_ok", lambda port: next(health))
+    monkeypatch.setattr(pipeline.time, "sleep", lambda _s: None)
+
+    px = pipeline._rotate_webshare_ip({
+        "webshare": {
+            "enabled": True,
+            "api_key": "secret",
+            "gost_listen_port": 18898,
+            "gost_health_retries": 2,
+            "gost_health_interval_s": 0,
+        },
+    })
+
+    assert px["proxy_address"] == "proxy.example"
+    assert calls and calls[-1][0] == "swap"

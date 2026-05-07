@@ -255,6 +255,56 @@ def _http_session_stage_proxy(session_obj, stage_proxy_cfg: dict | None, stage_n
             session_obj.proxies = prev_proxies
 
 
+def _resolve_refresh_token_proxy_url(cfg: dict) -> str:
+    if not isinstance(cfg, dict):
+        return ""
+    stage_proxy = _resolve_stage_proxy_cfg(cfg.get("stage_proxies") or {}, "refresh_token")
+    if stage_proxy is not _PROXY_OVERRIDE_SENTINEL:
+        return _build_proxy_url_from_cfg(stage_proxy)
+    fresh_cfg = cfg.get("fresh_checkout") or {}
+    if isinstance(fresh_cfg, dict):
+        rt_proxy = fresh_cfg.get("refresh_token_proxy")
+        if rt_proxy not in (None, ""):
+            return _build_proxy_url_from_cfg(rt_proxy)
+        if "proxy" in fresh_cfg:
+            return _build_proxy_url_from_cfg(fresh_cfg.get("proxy"))
+    return _build_proxy_url_from_cfg(cfg.get("proxy"))
+
+
+def _build_camoufox_proxy(proxy_url: str, relay_port: int = 18898):
+    if not proxy_url:
+        return None
+    try:
+        pp = urllib.parse.urlparse(proxy_url)
+    except Exception:
+        return None
+    scheme = (pp.scheme or "http").lower()
+    host = pp.hostname or ""
+    if not host:
+        return None
+    port = pp.port
+    user = urllib.parse.unquote(pp.username or "")
+    pwd = urllib.parse.unquote(pp.password or "")
+
+    if scheme in ("socks5", "socks5h"):
+        if user or pwd:
+            import socket as _sock
+            try:
+                with _sock.create_connection(("127.0.0.1", relay_port), timeout=2):
+                    pass
+                return {"server": f"socks5://127.0.0.1:{relay_port}"}
+            except Exception:
+                return None
+        server = f"socks5://{host}"
+    else:
+        server = f"{scheme}://{host}"
+    if port:
+        server += f":{port}"
+    if user or pwd:
+        return {"server": server, "username": user, "password": pwd}
+    return {"server": server}
+
+
 def _extract_api_error(resp) -> tuple[str, str]:
     try:
         data = resp.json()
@@ -1038,7 +1088,51 @@ def _b64url_seg(n: int = 32) -> str:
     return base64.urlsafe_b64encode(os.urandom(n)).rstrip(b"=").decode()
 
 
-def register_fingerprint(http: "requests.Session") -> tuple[str, str, str]:
+def _is_proxy_transport_error(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    needles = (
+        "connecttimeout",
+        "readtimeout",
+        "proxyerror",
+        "connectionerror",
+        "sslerror",
+        "socksh",
+        "socks",
+        "timed out",
+        "connect timeout",
+        "connection reset",
+        "max retries exceeded",
+        "connect tunnel failed",
+        "tunnel failed",
+        "response 503",
+        "503",
+        "network is unreachable",
+        "temporary failure",
+    )
+    return any(needle in text for needle in needles)
+
+
+def _recover_gost_for_proxy_failure(cfg: dict, config_path: str = "") -> bool:
+    ws_cfg = (cfg or {}).get("webshare") or {}
+    if not ws_cfg.get("enabled"):
+        return False
+    if ws_cfg.get("fingerprint_recover_on_proxy_error", True) is False:
+        return False
+    try:
+        import pipeline as _pipeline
+        _log("      [gost] 指纹阶段检测到代理异常，重启/验活本地中继 ...")
+        ok = bool(_pipeline._ensure_gost_alive(cfg, cfg_path=config_path or None))
+        if ok:
+            _log("      [gost] 本地中继已恢复，重试指纹请求")
+        else:
+            _log("      [gost] 本地中继恢复失败，继续后续兜底流程")
+        return ok
+    except Exception as e:
+        _log(f"      [gost] 指纹阶段代理恢复异常: {type(e).__name__}: {str(e)[:160]}")
+        return False
+
+
+def register_fingerprint(http: "requests.Session", recovery_hook=None) -> tuple[str, str, str]:
     """向 m.stripe.com/6 发送 4 次指纹上报, 返回服务端分配的 (guid, muid, sid)。
     如果请求失败, 返回本地随机生成的值。
     """
@@ -1110,40 +1204,57 @@ def register_fingerprint(http: "requests.Session") -> tuple[str, str, str]:
     }
     m6_url = "https://m.stripe.com/6"
     _log("      [指纹] 向 m.stripe.com/6 注册设备指纹 ...")
+    recovery_used = False
+
+    def _post_m6(label: str, payload: dict, allow_recovery: bool = True):
+        nonlocal recovery_used
+        try:
+            return http.post(m6_url, data=_encode_m6(payload), headers=m6_headers, timeout=10)
+        except Exception as e:
+            _log(f"      [指纹] {label} 失败: {e}")
+            if (
+                allow_recovery
+                and recovery_hook
+                and not recovery_used
+                and _is_proxy_transport_error(e)
+            ):
+                recovery_used = True
+                if recovery_hook(e):
+                    try:
+                        return http.post(m6_url, data=_encode_m6(payload), headers=m6_headers, timeout=10)
+                    except Exception as retry_e:
+                        _log(f"      [指纹] {label} 重试失败: {retry_e}")
+            return None
 
     # #1 完整指纹 (v2=1, 无 ID)
-    try:
-        r1 = http.post(m6_url, data=_encode_m6(_build_full(1, False)), headers=m6_headers, timeout=10)
-        if r1.status_code == 200:
-            j = r1.json()
-            muid = j.get("muid", muid)
-            guid = j.get("guid", guid)
-            sid = j.get("sid", sid)
-            _log(f"      [指纹] #1 OK → muid={muid[:20]}...")
-    except Exception as e:
-        _log(f"      [指纹] #1 失败: {e}")
+    r1 = _post_m6("#1", _build_full(1, False))
+    if r1 is not None and r1.status_code == 200:
+        j = r1.json()
+        muid = j.get("muid", muid)
+        guid = j.get("guid", guid)
+        sid = j.get("sid", sid)
+        _log(f"      [指纹] #1 OK → muid={muid[:20]}...")
 
     # #2 完整指纹 (v2=2, 带 ID)
-    try:
-        r2 = http.post(m6_url, data=_encode_m6(_build_full(2, True)), headers=m6_headers, timeout=10)
-        if r2.status_code == 200:
-            j = r2.json()
-            guid = j.get("guid", guid)
-            _log(f"      [指纹] #2 OK → guid={guid[:20]}...")
-    except Exception as e:
-        _log(f"      [指纹] #2 失败: {e}")
+    r2 = _post_m6("#2", _build_full(2, True))
+    if r2 is not None and r2.status_code == 200:
+        j = r2.json()
+        guid = j.get("guid", guid)
+        _log(f"      [指纹] #2 OK → guid={guid[:20]}...")
 
     # #3 鼠标行为 (mouse-timings-10-v2)
     try:
-        http.post(m6_url, data=_encode_m6(_build_mouse("mouse-timings-10-v2")), headers=m6_headers, timeout=10)
-        _log("      [指纹] #3 OK (mouse-timings-v2)")
+        r3 = _post_m6("#3", _build_mouse("mouse-timings-10-v2"), allow_recovery=False)
+        if r3 is not None:
+            _log("      [指纹] #3 OK (mouse-timings-v2)")
     except Exception:
         pass
 
     # #4 鼠标行为 (mouse-timings-10)
     try:
-        http.post(m6_url, data=_encode_m6(_build_mouse("mouse-timings-10")), headers=m6_headers, timeout=10)
-        _log("      [指纹] #4 OK (mouse-timings)")
+        r4 = _post_m6("#4", _build_mouse("mouse-timings-10"), allow_recovery=False)
+        if r4 is not None:
+            _log("      [指纹] #4 OK (mouse-timings)")
     except Exception:
         pass
 
@@ -5054,6 +5165,143 @@ def _safe_screenshot(page, path: str):
         pass
 
 
+_RT_READY_SELECTORS = (
+    'input[type="email"]',
+    'input[name="email"]',
+    'input[name="username"]',
+    'input[name="identifier"]',
+    'input[autocomplete="username"]',
+    'input[type="password"]',
+    'input[autocomplete="one-time-code"]',
+    'input[inputmode="numeric"]',
+    'button:has-text("Continue")',
+    'button:has-text("Authorize")',
+    'button:has-text("Allow")',
+)
+
+_RT_EMAIL_SELECTORS = (
+    'input[type="email"]:visible',
+    'input[name="email"]:visible',
+    'input[name="username"]:visible',
+    'input[name="identifier"]:visible',
+    'input[autocomplete="username"]:visible',
+)
+
+_RT_PASSWORD_SELECTORS = (
+    'input[type="password"]:visible',
+    'input[name="password"]:visible',
+    'input[autocomplete="current-password"]:visible',
+)
+
+_RT_BROWSER_ERROR_BUTTON_IDS = {
+    "neterrorTryAgainButton",
+    "certErrorTryAgainButton",
+    "exceptionDialogButton",
+    "advancedButton",
+    "returnButton",
+    "openInNewWindowButton",
+    "openPortalLoginPageButton",
+    "nativeFallbackContinueThisTimeButton",
+    "nativeFallbackIgnoreButton",
+}
+
+
+def _rt_page_ready_for_login_or_consent(page) -> bool:
+    """Return True only when the auth page has a usable DOM, not just a URL."""
+    if _rt_browser_error_snapshot(page):
+        return False
+    try:
+        cur = getattr(page, "url", "") or ""
+    except Exception:
+        cur = ""
+    if "localhost:1455" in cur and "code=" in cur:
+        return True
+    if "/add-phone" in cur or "phone-number" in cur or "/about-you" in cur:
+        return True
+    for sel in _RT_READY_SELECTORS:
+        try:
+            if page.query_selector(sel):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _rt_first_visible(page, selectors):
+    for sel in selectors:
+        try:
+            node = page.query_selector(sel)
+            if node and (not hasattr(node, "is_visible") or node.is_visible()):
+                return node
+        except Exception:
+            continue
+    return None
+
+
+def _rt_browser_error_snapshot(page):
+    try:
+        snap = page.evaluate("""
+            () => {
+                const ids = [
+                    'neterrorTryAgainButton',
+                    'certErrorTryAgainButton',
+                    'exceptionDialogButton',
+                    'advancedButton',
+                    'returnButton',
+                    'openInNewWindowButton',
+                    'openPortalLoginPageButton',
+                    'nativeFallbackContinueThisTimeButton',
+                    'nativeFallbackIgnoreButton'
+                ];
+                const buttonIds = ids.filter((id) => document.getElementById(id));
+                const bodyText = (document.body && document.body.innerText || '').slice(0, 500);
+                return {
+                    documentURI: document.documentURI || '',
+                    title: document.title || '',
+                    buttonIds,
+                    bodyText
+                };
+            }
+        """)
+    except Exception:
+        return None
+    if not isinstance(snap, dict):
+        return None
+    doc_uri = snap.get("documentURI", "") or ""
+    title = (snap.get("title", "") or "").lower()
+    button_ids = set(snap.get("buttonIds") or [])
+    body_text = (snap.get("bodyText", "") or "").lower()
+    if doc_uri.startswith("about:neterror") or doc_uri.startswith("about:certerror"):
+        return snap
+    if button_ids & _RT_BROWSER_ERROR_BUTTON_IDS:
+        return snap
+    if "problem loading page" in title or "secure connection failed" in body_text:
+        return snap
+    return None
+
+
+def _rt_click_otp_resend(page) -> bool:
+    for sel in [
+        'button:has-text("Resend")',
+        'button:has-text("Resend code")',
+        'button:has-text("Send again")',
+        'button:has-text("Send new code")',
+        'button:has-text("Try again")',
+        'a:has-text("Resend")',
+        'a:has-text("Send again")',
+        '[data-testid*="resend"]',
+    ]:
+        try:
+            b = page.query_selector(sel)
+            if b and (not hasattr(b, "is_visible") or b.is_visible()):
+                b.click()
+                _log(f"      [RT] OTP 重发点击: {sel}")
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _rt_open_authorize_page(page, auth_url: str, attempts: int = 3,
                             log_func=None, sleep_func=None) -> bool:
     """Open Codex authorize URL and recover from transient blank-page resets."""
@@ -5080,7 +5328,17 @@ def _rt_open_authorize_page(page, auth_url: str, attempts: int = 3,
                 page.wait_for_load_state("domcontentloaded", timeout=5000)
             except Exception:
                 pass
-            return True
+            err_snap = _rt_browser_error_snapshot(page)
+            if err_snap:
+                log(
+                    "      [RT] 检测到浏览器网络错误页，继续重试打开 authorize URL: "
+                    f"buttons={err_snap.get('buttonIds')}"
+                )
+                if attempt < attempts:
+                    continue
+            if _rt_page_ready_for_login_or_consent(page):
+                return True
+            log(f"      [RT] 页面未就绪，继续重试打开 authorize URL ({attempt}/{attempts})")
 
         if attempt < attempts:
             sleep(1)
@@ -5092,7 +5350,11 @@ def _rt_open_authorize_page(page, auth_url: str, attempts: int = 3,
     return False
 
 
-def _fetch_openai_login_otp(target_email: str, timeout: int = 180) -> str:
+def _fetch_openai_login_otp(
+    target_email: str,
+    timeout: int = 180,
+    issued_after: float | None = None,
+) -> str:
     """从 CF KV 取 OpenAI 登录 OTP（worker 已替代 IMAP→QQ 转发链路）。
 
     返回空串表示超时或 KV 路径配置缺失，调用方按需 fallback。
@@ -5104,7 +5366,7 @@ def _fetch_openai_login_otp(target_email: str, timeout: int = 180) -> str:
         return ""
     try:
         provider = CloudflareKVOtpProvider.from_env_or_secrets()
-        return provider.wait_for_otp(target_email, timeout=timeout)
+        return provider.wait_for_otp(target_email, timeout=timeout, issued_after=issued_after)
     except TimeoutError:
         _log(f"      [RT-OTP] CF KV 等 OTP 超时 {timeout}s")
         return ""
@@ -5189,22 +5451,10 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
         "codex_cli_simplified_flow": "true",
     })
 
-    # Camoufox proxy
-    cf_proxy = None
-    if proxy_url:
-        pp = _urlparse(proxy_url)
-        if pp.scheme in ("socks5", "socks5h") and pp.username:
-            import socket as _sock
-            relay_port = 18899
-            try:
-                with _sock.create_connection(("127.0.0.1", relay_port), timeout=2):
-                    pass
-                cf_proxy = {"server": f"socks5://127.0.0.1:{relay_port}"}
-            except Exception:
-                pass
-        else:
-            cf_proxy = {"server": f"{pp.scheme}://{pp.hostname}:{pp.port}",
-                        "username": pp.username or "", "password": pp.password or ""}
+    cf_proxy = _build_camoufox_proxy(proxy_url)
+    if proxy_url and not cf_proxy:
+        _log("      [RT] 代理已配置但 Camoufox 不可用，停止 refresh_token 获取，避免直连出口不一致")
+        return ""
 
     has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     tmp_profile = _tmp.mkdtemp(prefix="rt_login_")
@@ -5243,40 +5493,48 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                 _safe_screenshot(page, "/tmp/rt_authorize_blank.png")
                 return ""
 
-            # [2] 填邮箱
+            # [2] 填邮箱：如果已经带登录态进入 consent/authorize 页，不要把无邮箱框当失败。
+            submitted_email = False
             try:
-                page.wait_for_selector('input[type="email"], input[name="email"]',
-                                       state="visible", timeout=20000)
-                email_input = page.query_selector('input[type="email"]:visible') or \
-                              page.query_selector('input[name="email"]:visible')
-                email_input.click(); time.sleep(0.3)
-                email_input.fill(email)
-                time.sleep(random.uniform(0.5, 1.2))
-                for sel in ['button[type="submit"]', 'button:has-text("Continue")', '#btnNext']:
-                    b = page.query_selector(sel)
-                    if b and b.is_visible():
-                        b.click()
-                        _log("      [RT] 邮箱提交")
-                        break
-                time.sleep(3)
+                email_input = _rt_first_visible(page, _RT_EMAIL_SELECTORS)
+                if not email_input:
+                    _log(f"      [RT] 当前页面无邮箱输入框，跳过邮箱填写: {page.url[:120]}")
+                    _safe_screenshot(page, "/tmp/rt_no_email_input.png")
+                else:
+                    email_input.click(); time.sleep(0.3)
+                    email_input.fill(email)
+                    time.sleep(random.uniform(0.5, 1.2))
+                    for sel in ['button[type="submit"]', 'button:has-text("Continue")', '#btnNext']:
+                        b = page.query_selector(sel)
+                        if b and b.is_visible():
+                            b.click()
+                            submitted_email = True
+                            _log("      [RT] 邮箱提交")
+                            break
+                    time.sleep(3)
             except Exception as e:
                 _log(f"      [RT] 邮箱填写失败: {e}")
                 return ""
 
-            # [3] 填密码（OpenAI 现在很多场景走 passwordless，没密码框就跳过到 OTP）
+            # [3] 填密码（OpenAI 现在很多场景走 passwordless，没密码框就跳过到 OTP/consent）
             try:
-                page.wait_for_selector('input[type="password"]', state="visible", timeout=20000)
-                pwd_input = page.query_selector('input[type="password"]:visible')
-                pwd_input.click(); time.sleep(0.3)
-                pwd_input.fill(password)
-                time.sleep(random.uniform(0.5, 1.2))
-                for sel in ['button[type="submit"]', 'button:has-text("Continue")']:
-                    b = page.query_selector(sel)
-                    if b and b.is_visible():
-                        b.click()
-                        _log("      [RT] 密码提交")
-                        break
-                time.sleep(5)
+                pwd_input = _rt_first_visible(page, _RT_PASSWORD_SELECTORS)
+                if not pwd_input and submitted_email:
+                    page.wait_for_selector('input[type="password"]', state="visible", timeout=20000)
+                    pwd_input = _rt_first_visible(page, _RT_PASSWORD_SELECTORS)
+                if not pwd_input:
+                    _log(f"      [RT] 当前页面无密码输入框，跳过密码填写: {page.url[:120]}")
+                else:
+                    pwd_input.click(); time.sleep(0.3)
+                    pwd_input.fill(password)
+                    time.sleep(random.uniform(0.5, 1.2))
+                    for sel in ['button[type="submit"]', 'button:has-text("Continue")']:
+                        b = page.query_selector(sel)
+                        if b and b.is_visible():
+                            b.click()
+                            _log("      [RT] 密码提交")
+                            break
+                    time.sleep(5)
             except Exception as e:
                 _log(f"      [RT] 密码框超时（passwordless 路径），跳过到 OTP 等待: {str(e)[:80]}")
                 _safe_screenshot(page, "/tmp/rt_pwd_skip.png")
@@ -5303,16 +5561,52 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                     _log(f"      [RT] URL: {cur[:140]}")
                     last_url = cur
                     last_log_ts = now
+                err_snap = _rt_browser_error_snapshot(page)
+                if err_snap:
+                    _log(
+                        "      [RT] 检测到浏览器网络错误页，重载 authorize URL: "
+                        f"buttons={err_snap.get('buttonIds')}"
+                    )
+                    retried = False
+                    try:
+                        b = page.query_selector("#neterrorTryAgainButton")
+                        if b and b.is_visible():
+                            b.click()
+                            retried = True
+                            time.sleep(5)
+                    except Exception:
+                        pass
+                    if not retried:
+                        try:
+                            page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
+                        except Exception as e_nav2:
+                            _log(f"      [RT] 网络错误页重载异常: {str(e_nav2)[:120]}")
+                        time.sleep(5)
+                    continue
                 # OTP 页
                 if ("/email-otp" in cur or "passwordless" in cur or
                     page.query_selector('input[autocomplete="one-time-code"]') or
                     page.query_selector('input[inputmode="numeric"]')):
                     if not otp_fetched:
-                        _log("      [RT] 检测到 OTP 页面，从 IMAP 取验证码 ...")
-                        otp_code = _fetch_openai_login_otp(target_email=email, timeout=180)
+                        _log("      [RT] 检测到 OTP 页面，从 CF KV 取验证码 ...")
+                        otp_code = _fetch_openai_login_otp(
+                            target_email=email,
+                            timeout=180,
+                            issued_after=otp_sent_ts,
+                        )
                         if not otp_code:
-                            _log("      [RT] OTP 获取超时")
-                            return ""
+                            _log("      [RT] OTP 首次获取超时，尝试页面重发 ...")
+                            if _rt_click_otp_resend(page):
+                                otp_sent_ts = time.time()
+                                time.sleep(2)
+                                otp_code = _fetch_openai_login_otp(
+                                    target_email=email,
+                                    timeout=120,
+                                    issued_after=otp_sent_ts,
+                                )
+                            if not otp_code:
+                                _log("      [RT] OTP 获取超时")
+                                return ""
                         _log(f"      [RT] OTP 已获取 (len={len(otp_code)})")
                         # 填入 OTP
                         filled = False
@@ -8114,8 +8408,19 @@ def run(
         for stage_name in sorted(stage_proxy_cfg):
             _log(f"        - {stage_name}: {_describe_proxy_cfg(stage_proxy_cfg.get(stage_name))}")
 
+    fingerprint_recovery = {"used": False}
+
+    def _recover_fingerprint_proxy_error(_exc):
+        if fingerprint_recovery["used"]:
+            return False
+        fingerprint_recovery["used"] = True
+        return _recover_gost_for_proxy_failure(cfg, config_path=resolved_config_path)
+
     with _http_session_stage_proxy(http, stage_proxy_cfg, "fingerprint"):
-        reg_guid, reg_muid, reg_sid = register_fingerprint(http)
+        reg_guid, reg_muid, reg_sid = register_fingerprint(
+            http,
+            recovery_hook=_recover_fingerprint_proxy_error,
+        )
 
     effective_checkout_input = checkout_input
     fresh_cfg = cfg.get("fresh_checkout") or {}
@@ -8737,7 +9042,7 @@ def run(
 	                    email=chatgpt_email,
 	                    password=_password,
 	                    mail_cfg=_mail_cfg,
-	                    proxy_url=_build_proxy_url_from_cfg(cfg.get("proxy")) if isinstance(cfg, dict) else "",
+	                    proxy_url=_resolve_refresh_token_proxy_url(cfg),
 	                    oauth_client_id=_codex_oauth_client_id_from_config(cfg),
 	                )
                 if rt_value:
