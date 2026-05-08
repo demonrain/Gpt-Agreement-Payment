@@ -32,8 +32,17 @@ _REGISTRY = {
 
 
 @router.get("/adb/devices")
-def adb_devices(user: str = CurrentUser):
-    return adb_check.list_devices()
+def adb_devices(
+    scan_lan: bool | None = None,
+    scan_subnets: str | None = None,
+    scan_ports: str | None = None,
+    user: str = CurrentUser,
+):
+    return adb_check.list_devices({
+        "scan_lan": scan_lan,
+        "scan_subnets": scan_subnets,
+        "scan_ports": scan_ports,
+    })
 
 
 @router.post("/{name}")

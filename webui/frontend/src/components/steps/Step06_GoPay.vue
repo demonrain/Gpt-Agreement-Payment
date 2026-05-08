@@ -16,6 +16,13 @@
       <TermField v-model.number="form.otp_timeout" label="OTP 等待超时秒数" type="number" />
       <template v-if="form.otp_source === 'adb'">
         <TermField v-model="form.adb_serial" label="ADB 设备序列号 · adb_serial" placeholder="先点「扫描 ADB 设备」获取正确地址" />
+        <div class="adb-scan-settings">
+          <TermToggle v-model="form.adb_scan_lan">启用局域网 ADB 扫描</TermToggle>
+          <div class="adb-scan-grid">
+            <TermField v-model="form.adb_scan_subnets" label="扫描网段 · scan_subnets" placeholder="192.168.0.0/24 或 192.168.0.55/32" />
+            <TermField v-model="form.adb_scan_ports" label="扫描端口 · scan_ports" placeholder="5555,5557,7555" />
+          </div>
+        </div>
         <div class="adb-actions">
           <button class="btn-term" :disabled="adbChecking" @click="listAdbDevices">
             {{ adbChecking ? '检测中...' : '$ 扫描 ADB 设备' }}
@@ -132,16 +139,21 @@ const form = ref({
   otp_source: init.otp_source ?? "auto",
   otp_timeout: init.otp_timeout ?? initOtp.timeout ?? 300,
   adb_serial: init.adb_serial ?? "127.0.0.1:7555",
+  adb_scan_lan: init.adb_scan_lan ?? true,
+  adb_scan_subnets: init.adb_scan_subnets ?? "192.168.0.0/24",
+  adb_scan_ports: init.adb_scan_ports ?? "5555,5557,7555,16348,16384,16416,16448,16480,62001",
   appium_url: init.appium_url ?? "http://127.0.0.1:4723",
   whatsapp_engine: init.whatsapp_engine ?? "baileys",
   auto_unlink: init.auto_unlink ?? false,
 });
 
 interface AdbDevice { serial: string; state: string; model: string }
+interface AdbLanScan { enabled: boolean; subnets: string[]; ports: number[] }
 const adbDevices = ref<AdbDevice[]>([]);
 const adbChecking = ref(false);
 const adbTesting = ref(false);
 const adbTestResult = ref<PreflightResult | null>(null);
+const adbLanScan = ref<AdbLanScan | null>(null);
 
 const adbQuickPorts = ref([
   { name: "MuMu", serial: "127.0.0.1:7555" },
@@ -159,17 +171,31 @@ async function listAdbDevices() {
   adbChecking.value = true;
   adbDevices.value = [];
   adbScanError.value = "";
+  adbLanScan.value = null;
   try {
-    const { data } = await api.get("/preflight/adb/devices");
+    const { data } = await api.get("/preflight/adb/devices", {
+      params: {
+        scan_lan: form.value.adb_scan_lan,
+        scan_subnets: form.value.adb_scan_subnets,
+        scan_ports: form.value.adb_scan_ports,
+      },
+    });
     if (data.ok) {
       adbDevices.value = data.devices ?? [];
+      adbLanScan.value = data.lan_scan ?? null;
       if (data.known_ports) {
         adbQuickPorts.value = Object.entries(data.known_ports as Record<string, string>).map(
           ([k, v]) => ({ name: k.replace("mumu12", "MuMu 12").replace("mumu", "MuMu").replace("ldplayer", "雷电").replace("nox", "夜神").replace("bluestacks", "BlueStacks"), serial: v }),
         );
       }
       if (data.hint) adbHostHint.value = data.hint;
-      if (!adbDevices.value.length) adbScanError.value = "未检测到任何 ADB 设备。请确认模拟器已启动且 ADB 调试已开启。";
+      if (!adbDevices.value.length) {
+        const scan = adbLanScan.value;
+        const scope = scan?.enabled
+          ? `已扫描局域网 ${scan.subnets?.join(", ") || "(未检测到网段)"} 端口 ${scan.ports?.join(", ") || "5555/5557"}`
+          : "局域网扫描已关闭";
+        adbScanError.value = `未检测到任何 ADB 设备。${scope}。请确认设备 IP 在扫描网段内，且 ADB TCP 端口已开启。`;
+      }
     } else {
       adbScanError.value = data.error || "扫描失败";
     }
@@ -261,6 +287,18 @@ watch(form, () => {
 .adb-actions {
   display: flex;
   gap: 8px;
+  margin-top: 8px;
+}
+.adb-scan-settings {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-base);
+}
+.adb-scan-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
   margin-top: 8px;
 }
 .btn-term {
@@ -364,5 +402,8 @@ watch(form, () => {
 }
 .unlink-btn:hover:not(:disabled) {
   background: rgba(245, 158, 11, 0.08) !important;
+}
+@media (max-width: 720px) {
+  .adb-scan-grid { grid-template-columns: 1fr; }
 }
 </style>

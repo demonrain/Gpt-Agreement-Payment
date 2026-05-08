@@ -166,6 +166,131 @@ def test_list_devices_refreshes_wsl_host_ip_for_known_ports(monkeypatch):
     ]
 
 
+def test_list_devices_connects_adb_mdns_services_when_no_online_device(monkeypatch):
+    monkeypatch.setattr(adb.shutil, "which", lambda name: "adb" if name == "adb" else None)
+    monkeypatch.setattr(adb, "_HOST_IP", "192.168.50.10")
+    monkeypatch.setattr(adb, "_detect_host_ip", lambda: "192.168.50.10")
+    monkeypatch.setattr(adb._sock, "create_connection", lambda endpoint, timeout=0.5: _FakeSocket())
+
+    outputs = iter([
+        (0, "List of devices attached\n\n", ""),
+        (0, "List of devices attached\n\n", ""),
+        (0, "List of devices attached\n192.168.50.44:37199 device model:Pixel\n", ""),
+    ])
+    connected = []
+
+    def fake_run_adb(serial, *args, timeout=10):
+        if args == ("devices", "-l"):
+            return next(outputs)
+        if args == ("mdns", "services"):
+            return (
+                0,
+                "List of discovered mdns services\n"
+                "adb-123._adb-tls-connect._tcp. 192.168.50.44:37199\n",
+                "",
+            )
+        if args[0] == "connect":
+            connected.append(args[1])
+        return 0, "", ""
+
+    monkeypatch.setattr(adb, "_run_adb", fake_run_adb)
+
+    result = adb.list_devices()
+
+    assert "192.168.50.44:37199" in connected
+    assert result["devices"] == [
+        {"serial": "192.168.50.44:37199", "state": "device", "model": "Pixel"}
+    ]
+
+
+def test_list_devices_scans_configured_lan_subnet_for_adb_tcp(monkeypatch):
+    monkeypatch.setenv("GPT_PAY_ADB_SCAN_SUBNETS", "192.168.50.44/32")
+    monkeypatch.setenv("GPT_PAY_ADB_SCAN_PORTS", "5555")
+    monkeypatch.setattr(adb.shutil, "which", lambda name: "adb" if name == "adb" else None)
+    monkeypatch.setattr(adb, "_HOST_IP", "192.168.50.10")
+    monkeypatch.setattr(adb, "_detect_host_ip", lambda: "192.168.50.10")
+
+    outputs = iter([
+        (0, "List of devices attached\n\n", ""),
+        (0, "List of devices attached\n\n", ""),
+        (0, "List of devices attached\n\n", ""),
+        (0, "List of devices attached\n192.168.50.44:5555 device model:Pixel\n", ""),
+    ])
+    connected = []
+
+    def fake_run_adb(serial, *args, timeout=10):
+        if args == ("devices", "-l"):
+            return next(outputs)
+        if args == ("mdns", "services"):
+            return 0, "List of discovered mdns services\n", ""
+        if args[0] == "connect":
+            connected.append(args[1])
+        return 0, "", ""
+
+    def fake_create_connection(endpoint, timeout=0.5):
+        if endpoint == ("192.168.50.44", 5555):
+            return _FakeSocket()
+        raise OSError()
+
+    monkeypatch.setattr(adb, "_run_adb", fake_run_adb)
+    monkeypatch.setattr(adb._sock, "create_connection", fake_create_connection)
+
+    result = adb.list_devices()
+
+    assert "192.168.50.44:5555" in connected
+    assert result["devices"] == [
+        {"serial": "192.168.50.44:5555", "state": "device", "model": "Pixel"}
+    ]
+    assert result["lan_scan"]["subnets"] == ["192.168.50.44/32"]
+    assert result["lan_scan"]["ports"] == [5555]
+
+
+def test_list_devices_uses_scan_options_over_environment(monkeypatch):
+    monkeypatch.setenv("GPT_PAY_ADB_SCAN_SUBNETS", "192.168.99.0/24")
+    monkeypatch.setenv("GPT_PAY_ADB_SCAN_PORTS", "5557")
+    monkeypatch.setattr(adb.shutil, "which", lambda name: "adb" if name == "adb" else None)
+    monkeypatch.setattr(adb, "_HOST_IP", "192.168.0.10")
+    monkeypatch.setattr(adb, "_detect_host_ip", lambda: "192.168.0.10")
+
+    outputs = iter([
+        (0, "List of devices attached\n\n", ""),
+        (0, "List of devices attached\n\n", ""),
+        (0, "List of devices attached\n\n", ""),
+        (0, "List of devices attached\n192.168.0.88:5555 device model:Pixel\n", ""),
+    ])
+    attempted = []
+
+    def fake_run_adb(serial, *args, timeout=10):
+        if args == ("devices", "-l"):
+            return next(outputs)
+        if args == ("mdns", "services"):
+            return 0, "List of discovered mdns services\n", ""
+        if args[0] == "connect":
+            attempted.append(args[1])
+        return 0, "", ""
+
+    def fake_create_connection(endpoint, timeout=0.5):
+        if endpoint == ("192.168.0.88", 5555):
+            return _FakeSocket()
+        raise OSError()
+
+    monkeypatch.setattr(adb, "_run_adb", fake_run_adb)
+    monkeypatch.setattr(adb._sock, "create_connection", fake_create_connection)
+
+    result = adb.list_devices({
+        "scan_subnets": "192.168.0.88/32",
+        "scan_ports": "5555",
+        "scan_lan": True,
+    })
+
+    assert attempted == ["192.168.0.88:5555"]
+    assert result["devices"] == [
+        {"serial": "192.168.0.88:5555", "state": "device", "model": "Pixel"}
+    ]
+    assert result["lan_scan"]["subnets"] == ["192.168.0.88/32"]
+    assert result["lan_scan"]["ports"] == [5555]
+
+
 class _FakeSocket:
     def __enter__(self):
         return self
