@@ -5302,6 +5302,107 @@ def _rt_click_otp_resend(page) -> bool:
     return False
 
 
+def _rt_fill_otp_code(page, otp_code: str, log_func=None, sleep_func=None) -> bool:
+    """Fill OpenAI login OTP without pointer clicks; floating labels can intercept clicks."""
+    log = log_func or _log
+    sleep = sleep_func or time.sleep
+    otp_code = (otp_code or "").strip()
+    if not otp_code:
+        return False
+
+    def _fill_node(node, value: str) -> bool:
+        if not node:
+            return False
+        try:
+            if hasattr(node, "is_visible") and not node.is_visible():
+                return False
+        except Exception:
+            return False
+        try:
+            node.fill(value)
+            return True
+        except Exception as e_fill:
+            log(f"      [RT] OTP fill 失败，尝试 JS 注入: {str(e_fill)[:80]}")
+        try:
+            evaluate = getattr(node, "evaluate", None)
+            if callable(evaluate):
+                evaluate(
+                    """(el, value) => {
+                        el.focus();
+                        el.value = value;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }""",
+                    value,
+                )
+                return True
+        except Exception as e_js:
+            log(f"      [RT] OTP JS 注入失败: {str(e_js)[:80]}")
+        return False
+
+    single = (
+        page.query_selector('input[autocomplete="one-time-code"]:visible')
+        or page.query_selector('input[inputmode="numeric"]:not([maxlength="1"]):visible')
+        or page.query_selector('input[name="code"]:visible')
+        or page.query_selector('input[id*="code"]:visible')
+    )
+    if _fill_node(single, otp_code):
+        return True
+
+    digits = (
+        page.query_selector_all('input[maxlength="1"][inputmode="numeric"]')
+        or page.query_selector_all('input[maxlength="1"]')
+    )
+    if len(digits) >= len(otp_code[:6]):
+        ok = True
+        for i, ch in enumerate(otp_code[:6]):
+            if not _fill_node(digits[i], ch):
+                ok = False
+                break
+            sleep(0.05)
+        if ok:
+            return True
+
+    try:
+        return bool(page.evaluate(
+            """(value) => {
+                const selectors = [
+                    'input[autocomplete="one-time-code"]',
+                    'input[inputmode="numeric"]:not([maxlength="1"])',
+                    'input[name="code"]',
+                    'input[id*="code"]'
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        el.focus();
+                        el.value = value;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        return true;
+                    }
+                }
+                const boxes = Array.from(document.querySelectorAll(
+                    'input[maxlength="1"][inputmode="numeric"], input[maxlength="1"]'
+                ));
+                if (boxes.length >= value.length) {
+                    [...value].forEach((ch, i) => {
+                        boxes[i].focus();
+                        boxes[i].value = ch;
+                        boxes[i].dispatchEvent(new Event('input', { bubbles: true }));
+                        boxes[i].dispatchEvent(new Event('change', { bubbles: true }));
+                    });
+                    return true;
+                }
+                return false;
+            }""",
+            otp_code,
+        ))
+    except Exception as e_eval:
+        log(f"      [RT] OTP 页面 JS 填写失败: {str(e_eval)[:80]}")
+        return False
+
+
 def _rt_open_authorize_page(page, auth_url: str, attempts: int = 3,
                             log_func=None, sleep_func=None) -> bool:
     """Open Codex authorize URL and recover from transient blank-page resets."""
@@ -5609,18 +5710,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                                 return ""
                         _log(f"      [RT] OTP 已获取 (len={len(otp_code)})")
                         # 填入 OTP
-                        filled = False
-                        single = page.query_selector('input[autocomplete="one-time-code"]:visible') or \
-                                 page.query_selector('input[inputmode="numeric"]:not([maxlength="1"]):visible')
-                        if single:
-                            single.click(); time.sleep(0.3); single.fill(otp_code); filled = True
-                        else:
-                            digits = page.query_selector_all('input[maxlength="1"][inputmode="numeric"]') or \
-                                     page.query_selector_all('input[maxlength="1"]')
-                            if len(digits) >= 6:
-                                for i, ch in enumerate(otp_code[:6]):
-                                    digits[i].click(); time.sleep(0.1); digits[i].fill(ch)
-                                filled = True
+                        filled = _rt_fill_otp_code(page, otp_code)
                         if filled:
                             time.sleep(0.5)
                             for sel in ['button[type="submit"]', 'button:has-text("Continue")',

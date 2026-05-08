@@ -76,6 +76,35 @@ class FakeVisibleNode:
         self.clicks += 1
 
 
+class FakeOtpInput:
+    def __init__(self):
+        self.clicks = 0
+        self.fills = []
+
+    def is_visible(self):
+        return True
+
+    def click(self):
+        self.clicks += 1
+        raise TimeoutError("label intercepts pointer events")
+
+    def fill(self, value):
+        self.fills.append(value)
+
+
+class FakeOtpPage:
+    def __init__(self):
+        self.single = FakeOtpInput()
+
+    def query_selector(self, selector):
+        if selector == 'input[autocomplete="one-time-code"]:visible':
+            return self.single
+        return None
+
+    def query_selector_all(self, _selector):
+        return []
+
+
 class FakeSelectorPage:
     def __init__(self, visible_selectors):
         self.visible_selectors = set(visible_selectors)
@@ -492,6 +521,22 @@ def test_rt_click_otp_resend_clicks_visible_resend_button():
 
     assert clicked is True
     assert button.clicks == 1
+
+
+def test_rt_fill_otp_code_does_not_click_intercepted_input():
+    card = _load_card_module()
+    page = FakeOtpPage()
+
+    filled = card._rt_fill_otp_code(
+        page,
+        "123456",
+        log_func=lambda _line: None,
+        sleep_func=lambda _seconds: None,
+    )
+
+    assert filled is True
+    assert page.single.clicks == 0
+    assert page.single.fills == ["123456"]
 
 
 def test_exchange_refresh_token_normalizes_socks5h_proxy_for_camoufox(monkeypatch):
