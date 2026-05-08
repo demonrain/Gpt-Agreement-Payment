@@ -76,6 +76,15 @@ class FakeVisibleNode:
         self.clicks += 1
 
 
+class FakeFillableNode(FakeVisibleNode):
+    def __init__(self):
+        super().__init__()
+        self.fills = []
+
+    def fill(self, value):
+        self.fills.append(value)
+
+
 class FakeOtpInput:
     def __init__(self):
         self.clicks = 0
@@ -178,6 +187,85 @@ class FakeRefreshTokenPage:
         handler = self.routes.get("http://localhost:1455/**")
         if handler:
             handler(FakeRoute(url))
+
+
+class FakePasswordlessOtpPage(FakeRefreshTokenPage):
+    def __init__(self, clock, callback_after_otp_submits=1):
+        super().__init__()
+        self.clock = clock
+        self.callback_after_otp_submits = callback_after_otp_submits
+        self.email_input = FakeFillableNode()
+        self.otp_input = FakeOtpInput()
+        self.email_submitted_at = None
+        self.otp_submit_count = 0
+        self.resend_count = 0
+
+    def goto(self, url, wait_until=None, timeout=None):
+        self.url = "https://auth.openai.com/log-in"
+        return None
+
+    def wait_for_selector(self, selector, state=None, timeout=None):
+        self.wait_for_selector_calls.append(
+            {"selector": selector, "state": state, "timeout": timeout}
+        )
+        if selector == 'input[type="password"]':
+            self.clock.now += 30.0
+        raise TimeoutError(f"no selector: {selector}")
+
+    def query_selector(self, selector):
+        if self.url.endswith("/log-in") and selector in {
+            'input[type="email"]',
+            'input[type="email"]:visible',
+        }:
+            return self.email_input
+        if selector in {
+            'input[autocomplete="one-time-code"]',
+            'input[autocomplete="one-time-code"]:visible',
+        }:
+            return self.otp_input if "email-verification" in self.url else None
+        if selector == 'button:has-text("Resend")' and "email-verification" in self.url:
+            return FakeResendButton(self)
+        if selector == 'button[type="submit"]':
+            return FakeSubmitButton(self)
+        return None
+
+
+class FakeResendButton(FakeVisibleNode):
+    def __init__(self, page):
+        super().__init__()
+        self.page = page
+
+    def click(self):
+        super().click()
+        self.page.resend_count += 1
+
+
+class FakeSubmitButton(FakeVisibleNode):
+    def __init__(self, page):
+        super().__init__()
+        self.page = page
+
+    def click(self):
+        super().click()
+        if self.page.url.endswith("/log-in"):
+            self.page.email_submitted_at = self.page.clock.time()
+            self.page.url = "https://auth.openai.com/email-verification"
+            return
+        if "email-verification" in self.page.url:
+            self.page.otp_submit_count += 1
+            if self.page.otp_submit_count >= self.page.callback_after_otp_submits:
+                self.page.trigger_callback("http://localhost:1455/auth/callback?code=auth-code")
+
+
+class FakeClock:
+    def __init__(self, now):
+        self.now = now
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += float(seconds)
 
 
 class FakeRefreshTokenContext:
@@ -539,6 +627,18 @@ def test_rt_fill_otp_code_does_not_click_intercepted_input():
     assert page.single.fills == ["123456"]
 
 
+def test_card_log_includes_rt_run_id_when_present(tmp_path, monkeypatch, capsys):
+    card = _load_card_module()
+    monkeypatch.setenv("RT_RUN_ID", "free-backfill:12345")
+    monkeypatch.setattr(card, "LOG_FILE", str(tmp_path / "card.log"))
+
+    card._log("      [RT] marker")
+
+    out = capsys.readouterr().out
+    assert "[free-backfill:12345]" in out
+    assert "[free-backfill:12345]" in (tmp_path / "card.log").read_text(encoding="utf-8")
+
+
 def test_exchange_refresh_token_normalizes_socks5h_proxy_for_camoufox(monkeypatch):
     card = _load_card_module()
     page = FakeRefreshTokenPage()
@@ -599,3 +699,63 @@ def test_exchange_refresh_token_continues_when_authorize_page_has_no_email_input
     assert page.wait_for_selector_calls == []
     assert page.clicked_selectors == ['button:has-text("Authorize")']
     assert any("跳过邮箱填写" in line for line in logs)
+
+
+def test_exchange_refresh_token_uses_email_submit_time_for_passwordless_otp(monkeypatch):
+    card = _load_card_module()
+    clock = FakeClock(1000.0)
+    page = FakePasswordlessOtpPage(clock)
+    _install_refresh_token_fakes(monkeypatch, page)
+    monkeypatch.setattr(card.time, "time", clock.time)
+    monkeypatch.setattr(card.time, "sleep", clock.sleep)
+    monkeypatch.setattr(card.random, "uniform", lambda _start, _end: 0)
+    logs = []
+    monkeypatch.setattr(card, "_log", logs.append)
+    issued_after_values = []
+
+    def fake_fetch_otp(target_email, timeout=180, issued_after=None):
+        issued_after_values.append(issued_after)
+        return "123456"
+
+    monkeypatch.setattr(card, "_fetch_openai_login_otp", fake_fetch_otp)
+
+    token = card._exchange_refresh_token_with_session(
+        email="buyer@example.com",
+        password="unused-password",
+        mail_cfg={"provider": "unused"},
+    )
+
+    assert token == "rt_test", logs
+    assert issued_after_values == [page.email_submitted_at]
+
+
+def test_exchange_refresh_token_resends_when_otp_page_stays_after_submit(monkeypatch):
+    card = _load_card_module()
+    clock = FakeClock(1000.0)
+    page = FakePasswordlessOtpPage(clock, callback_after_otp_submits=2)
+    _install_refresh_token_fakes(monkeypatch, page)
+    monkeypatch.setattr(card.time, "time", clock.time)
+    monkeypatch.setattr(card.time, "sleep", clock.sleep)
+    monkeypatch.setattr(card.random, "uniform", lambda _start, _end: 0)
+    logs = []
+    monkeypatch.setattr(card, "_log", logs.append)
+    codes = iter(["111111", "222222"])
+    issued_after_values = []
+
+    def fake_fetch_otp(target_email, timeout=180, issued_after=None):
+        issued_after_values.append(issued_after)
+        return next(codes)
+
+    monkeypatch.setattr(card, "_fetch_openai_login_otp", fake_fetch_otp)
+
+    token = card._exchange_refresh_token_with_session(
+        email="buyer@example.com",
+        password="unused-password",
+        mail_cfg={"provider": "unused"},
+    )
+
+    assert token == "rt_test", logs
+    assert page.otp_submit_count == 2
+    assert page.resend_count == 1
+    assert issued_after_values[0] == page.email_submitted_at
+    assert issued_after_values[1] > issued_after_values[0]

@@ -31,6 +31,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1628,8 +1629,136 @@ def _classify_oauth_failure(log: str) -> str:
     return "unknown"
 
 
+def _oauth_lock_path(name: str) -> Path:
+    lock_dir = OUTPUT_DIR / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in (name or "oauth"))
+    return lock_dir / f"{safe}.lock"
+
+
+def _iter_linux_process_cmds() -> list[dict]:
+    rows: list[dict] = []
+    proc_dir = Path("/proc")
+    if not proc_dir.exists():
+        return rows
+    try:
+        for p in proc_dir.iterdir():
+            if not p.name.isdigit():
+                continue
+            try:
+                raw = (p / "cmdline").read_bytes()
+                stat_text = (p / "stat").read_text(errors="replace")
+            except Exception:
+                continue
+            cmd = raw.replace(b"\x00", b" ").decode(errors="replace").strip()
+            parts = stat_text.split()
+            ppid = parts[3] if len(parts) > 3 else ""
+            rows.append({"pid": p.name, "ppid": ppid, "cmd": cmd[:240]})
+    except Exception:
+        pass
+    return rows
+
+
+def _linux_ancestor_pids(pid: int) -> set[int]:
+    ancestors: set[int] = set()
+    current = pid
+    for _ in range(32):
+        try:
+            stat_text = (Path("/proc") / str(current) / "stat").read_text(errors="replace")
+            parts = stat_text.split()
+            parent = int(parts[3]) if len(parts) > 3 else 0
+        except Exception:
+            break
+        if parent <= 0 or parent in ancestors:
+            break
+        ancestors.add(parent)
+        current = parent
+    return ancestors
+
+
+def _find_running_free_backfill_processes() -> list[dict]:
+    """Find already-running free-backfill processes, including old versions without locks."""
+    needle = "--free-backfill-rt"
+    self_pid = os.getpid()
+    found: list[dict] = []
+
+    rows = _iter_linux_process_cmds()
+    if rows:
+        ancestor_pids = _linux_ancestor_pids(self_pid)
+        for row in rows:
+            try:
+                pid = int(row.get("pid") or 0)
+            except Exception:
+                continue
+            if pid == self_pid or pid in ancestor_pids:
+                continue
+            cmd = row.get("cmd") or ""
+            if "pipeline.py" in cmd and needle in cmd:
+                found.append({"pid": str(pid), "cmd": cmd[:240]})
+        return found
+
+    try:
+        out = subprocess.check_output(["pgrep", "-af", "pipeline.py"], text=True, timeout=5)
+    except Exception:
+        return found
+    for line in out.splitlines():
+        parts = line.strip().split(" ", 1)
+        if len(parts) != 2:
+            continue
+        pid_s, cmd = parts
+        try:
+            if int(pid_s) == self_pid:
+                continue
+        except Exception:
+            pass
+        if needle in cmd:
+            found.append({"pid": pid_s, "cmd": cmd[:240]})
+    return found
+
+
+@contextmanager
+def _nonblocking_file_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+", encoding="utf-8")
+    acquired = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                acquired = True
+            except OSError:
+                acquired = False
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except OSError:
+                acquired = False
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+        handle.close()
+
+
 def _exchange_rt_with_classification(
-    email: str, password: str, mail_cfg: dict, proxy_url: str
+    email: str, password: str, mail_cfg: dict, proxy_url: str, run_id: str = ""
 ):
     """包 card._exchange_refresh_token_with_session 加失败分类。
 
@@ -1668,6 +1797,9 @@ def _exchange_rt_with_classification(
     real_stdout = sys.stdout
     sys.stdout = _Tee(buf, real_stdout)
     rt = ""
+    old_run_id = os.environ.get("RT_RUN_ID")
+    if run_id:
+        os.environ["RT_RUN_ID"] = run_id
     try:
         try:
             rt = card_mod._exchange_refresh_token_with_session(
@@ -1680,6 +1812,11 @@ def _exchange_rt_with_classification(
             print(f"[free] _exchange_rt 异常: {e}")
             return "", "exception"
     finally:
+        if run_id:
+            if old_run_id is None:
+                os.environ.pop("RT_RUN_ID", None)
+            else:
+                os.environ["RT_RUN_ID"] = old_run_id
         sys.stdout = real_stdout
 
     log = buf.getvalue()
@@ -3823,7 +3960,10 @@ def free_register_loop(card_config_path, cardw_config_path=None, count: int = 0)
             password = reg.get("password") or _password_from_email(email)
             sid = reg.get("device_id", "") or hashlib.md5(email.encode()).hexdigest()[:16]
 
-            rt, fail = _exchange_rt_with_classification(email, password, mail_cfg, proxy_url)
+            run_id = f"free-register:{os.getpid()}:{iteration}/{count or 'inf'}"
+            rt, fail = _exchange_rt_with_classification(
+                email, password, mail_cfg, proxy_url, run_id=run_id,
+            )
 
             if rt:
                 print(f"[free] [{iteration}] register {email} → succeeded rt_len={len(rt)}")
@@ -3860,6 +4000,23 @@ def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
     跳过：已有 refresh_token / oauth_status==succeeded / oauth_status==dead /
     transient_failed 在 6h cooldown 内的账号。
     """
+    lock_path = _oauth_lock_path("free-backfill-rt")
+    with _nonblocking_file_lock(lock_path) as locked:
+        if not locked:
+            print(f"[free-backfill] 已有 free-backfill-rt 正在运行，跳过本次启动 lock={lock_path}")
+            return
+        running = _find_running_free_backfill_processes()
+        if running:
+            owner = running[0]
+            print(
+                "[free-backfill] 已有 free-backfill-rt 进程正在运行，跳过本次启动 "
+                f"pid={owner.get('pid')} cmd={owner.get('cmd')}"
+            )
+            return
+        return _free_backfill_rt_loop_locked(card_config_path, cardw_config_path=cardw_config_path)
+
+
+def _free_backfill_rt_loop_locked(card_config_path, cardw_config_path=None):
     import hashlib
 
     card_cfg = _read_card_cfg(card_config_path)
@@ -3922,7 +4079,10 @@ def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
 
         print(f"\n=== [free-backfill] [{i}/{len(todo)}] {email} ===")
 
-        rt, fail = _exchange_rt_with_classification(email, password, mail_cfg, proxy_url)
+        run_id = f"free-backfill:{os.getpid()}:{i}/{len(todo)}"
+        rt, fail = _exchange_rt_with_classification(
+            email, password, mail_cfg, proxy_url, run_id=run_id,
+        )
 
         if rt:
             print(f"[free] [{i}/{len(todo)}] backfill {email} → succeeded rt_len={len(rt)}")

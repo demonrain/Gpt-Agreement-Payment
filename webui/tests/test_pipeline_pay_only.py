@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import types
 
@@ -210,3 +211,130 @@ def test_cpa_import_falls_back_to_access_token_without_refresh_token(tmp_path, m
     assert body["access_token"].startswith("eyJhbGciOiJub25lIn0.")
     assert body["refresh_token"] == ""
     assert body["account_id"] == "acct_123"
+
+
+def test_free_backfill_rt_loop_exits_when_lock_already_held(tmp_path, monkeypatch, capsys):
+    db = _reset_db(tmp_path, monkeypatch)
+    db.add_registered_account({
+        "email": "locked@example.com",
+        "password": "pw",
+        "device_id": "dev",
+    })
+    card_config = tmp_path / "config.paypal.json"
+    card_config.write_text(json.dumps({
+        "mail": {},
+        "cpa": {},
+    }), encoding="utf-8")
+    lock_path = tmp_path / "free-backfill.lock"
+    lock_handle = open(lock_path, "a+", encoding="utf-8")
+
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_handle.seek(0)
+            msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        monkeypatch.setattr(pipeline, "_oauth_lock_path", lambda _name: lock_path)
+        monkeypatch.setattr(
+            pipeline,
+            "_exchange_rt_with_classification",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("should not run while lock is held")
+            ),
+        )
+
+        pipeline.free_backfill_rt_loop(str(card_config))
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                lock_handle.seek(0)
+                msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_handle.close()
+
+    assert "已有 free-backfill-rt 正在运行" in capsys.readouterr().out
+
+
+def test_free_backfill_rt_loop_exits_when_existing_process_detected(tmp_path, monkeypatch, capsys):
+    db = _reset_db(tmp_path, monkeypatch)
+    db.add_registered_account({
+        "email": "running@example.com",
+        "password": "pw",
+        "device_id": "dev",
+    })
+    card_config = tmp_path / "config.paypal.json"
+    card_config.write_text(json.dumps({
+        "mail": {},
+        "cpa": {},
+    }), encoding="utf-8")
+    monkeypatch.setattr(pipeline, "_oauth_lock_path", lambda _name: tmp_path / "free-backfill.lock")
+    monkeypatch.setattr(
+        pipeline,
+        "_find_running_free_backfill_processes",
+        lambda: [{"pid": "22622", "cmd": "python -u pipeline.py --free-backfill-rt"}],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_exchange_rt_with_classification",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("should not run while an older process is active")
+        ),
+    )
+
+    pipeline.free_backfill_rt_loop(str(card_config))
+
+    out = capsys.readouterr().out
+    assert "已有 free-backfill-rt 进程正在运行" in out
+    assert "22622" in out
+
+
+def test_find_running_free_backfill_processes_ignores_current_xvfb_parent(monkeypatch):
+    proc_rows = {
+        30498: (303, "/bin/sh /usr/bin/xvfb-run -a python -u pipeline.py --config cfg --free-backfill-rt"),
+        30501: (30498, "python -u pipeline.py --config cfg --free-backfill-rt"),
+    }
+    monkeypatch.setattr(pipeline.os, "getpid", lambda: 30501)
+    monkeypatch.setattr(pipeline, "_iter_linux_process_cmds", lambda: [
+        {"pid": str(pid), "ppid": str(ppid), "cmd": cmd}
+        for pid, (ppid, cmd) in proc_rows.items()
+    ])
+    monkeypatch.setattr(pipeline, "_linux_ancestor_pids", lambda _pid: {30498, 303})
+
+    running = pipeline._find_running_free_backfill_processes()
+
+    assert running == []
+
+
+def test_exchange_rt_sets_run_id_env(monkeypatch):
+    env_values = []
+
+    class FakeCardModule:
+        def _exchange_refresh_token_with_session(self, **_kwargs):
+            env_values.append(os.environ.get("RT_RUN_ID", ""))
+            return "rt_ok"
+
+    monkeypatch.setitem(sys.modules, "card", FakeCardModule())
+
+    rt, fail = pipeline._exchange_rt_with_classification(
+        "buyer@example.com",
+        "pw",
+        {},
+        "",
+        run_id="free-backfill:12345",
+    )
+
+    assert rt == "rt_ok"
+    assert fail == ""
+    assert env_values == ["free-backfill:12345"]
+    assert "RT_RUN_ID" not in os.environ

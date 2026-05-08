@@ -70,6 +70,9 @@ def _init_log():
 def _log(msg: str):
     """追加一行到 log.txt 并同时 print"""
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    run_id = os.environ.get("RT_RUN_ID", "").strip()
+    if run_id and "[RT" in msg:
+        msg = f"[{run_id}] {msg}"
     line = f"[{ts}] {msg}"
     print(line)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -5403,6 +5406,47 @@ def _rt_fill_otp_code(page, otp_code: str, log_func=None, sleep_func=None) -> bo
         return False
 
 
+def _rt_submit_otp_code(page, otp_code: str, log_func=None, sleep_func=None) -> bool:
+    """Fill and submit one OTP attempt."""
+    log = log_func or _log
+    sleep = sleep_func or time.sleep
+    filled = _rt_fill_otp_code(page, otp_code, log_func=log, sleep_func=sleep)
+    if not filled:
+        log("      [RT] OTP 填写失败")
+        return False
+    sleep(0.5)
+    clicked = False
+    for sel in ['button[type="submit"]', 'button:has-text("Continue")',
+                'button:has-text("Verify")']:
+        try:
+            b = page.query_selector(sel)
+            if b and b.is_visible():
+                b.click()
+                log("      [RT] OTP 提交")
+                clicked = True
+                break
+        except Exception as e_click:
+            log(f"      [RT] OTP 提交点击异常 {sel}: {str(e_click)[:80]}")
+    if not clicked:
+        try:
+            ok = page.evaluate("""
+                () => {
+                    const f = document.querySelector('form');
+                    if (f) { f.requestSubmit ? f.requestSubmit() : f.submit(); return true; }
+                    const btn = Array.from(document.querySelectorAll('button'))
+                        .find((b) => !b.disabled && /continue|verify|submit/i.test(b.innerText || b.textContent || ''));
+                    if (btn) { btn.click(); return true; }
+                    return false;
+                }
+            """)
+            if ok:
+                log("      [RT] OTP 表单提交")
+                clicked = True
+        except Exception as e_submit:
+            log(f"      [RT] OTP 表单提交异常: {str(e_submit)[:80]}")
+    return clicked
+
+
 def _rt_open_authorize_page(page, auth_url: str, attempts: int = 3,
                             log_func=None, sleep_func=None) -> bool:
     """Open Codex authorize URL and recover from transient blank-page resets."""
@@ -5596,6 +5640,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
 
             # [2] 填邮箱：如果已经带登录态进入 consent/authorize 页，不要把无邮箱框当失败。
             submitted_email = False
+            otp_sent_ts = time.time()
             try:
                 email_input = _rt_first_visible(page, _RT_EMAIL_SELECTORS)
                 if not email_input:
@@ -5610,6 +5655,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                         if b and b.is_visible():
                             b.click()
                             submitted_email = True
+                            otp_sent_ts = time.time()
                             _log("      [RT] 邮箱提交")
                             break
                     time.sleep(3)
@@ -5645,8 +5691,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
             _safe_screenshot(page, "/tmp/rt_after_pwd.png")
             # 最长等 4 分钟看能不能到 localhost callback
             end = time.time() + 240
-            otp_sent_ts = time.time()
-            otp_fetched = False
+            otp_attempts = 0
             last_url = ""
             last_log_ts = 0.0
             while time.time() < end:
@@ -5688,7 +5733,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                 if ("/email-otp" in cur or "passwordless" in cur or
                     page.query_selector('input[autocomplete="one-time-code"]') or
                     page.query_selector('input[inputmode="numeric"]')):
-                    if not otp_fetched:
+                    if otp_attempts < 2:
                         _log("      [RT] 检测到 OTP 页面，从 CF KV 取验证码 ...")
                         otp_code = _fetch_openai_login_otp(
                             target_email=email,
@@ -5710,18 +5755,19 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                                 return ""
                         _log(f"      [RT] OTP 已获取 (len={len(otp_code)})")
                         # 填入 OTP
-                        filled = _rt_fill_otp_code(page, otp_code)
-                        if filled:
-                            time.sleep(0.5)
-                            for sel in ['button[type="submit"]', 'button:has-text("Continue")',
-                                        'button:has-text("Verify")']:
-                                b = page.query_selector(sel)
-                                if b and b.is_visible():
-                                    b.click()
-                                    _log("      [RT] OTP 提交")
-                                    break
-                            otp_fetched = True
+                        if _rt_submit_otp_code(page, otp_code):
+                            otp_attempts += 1
                             time.sleep(3)
+                            if "localhost:1455" in page.url and "code=" in page.url:
+                                code_captured["url"] = page.url
+                                break
+                            if "email-verification" in (page.url or "") and otp_attempts < 2:
+                                _log("      [RT] OTP 提交后仍停留在验证页，尝试重发新验证码 ...")
+                                if _rt_click_otp_resend(page):
+                                    otp_sent_ts = time.time()
+                                    time.sleep(2)
+                                else:
+                                    otp_attempts = 2
                 # /about-you 页（偶尔会出现）— 跳过
                 if "/about-you" in cur:
                     for sel in ['button:has-text("Finish")', 'button:has-text("Continue")',
