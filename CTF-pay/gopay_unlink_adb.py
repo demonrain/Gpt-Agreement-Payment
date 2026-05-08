@@ -140,6 +140,66 @@ def _find_no_linked_apps(xml: str) -> dict | None:
     return _find_by_desc(xml, re.compile(r"(?i)no\s*app.*linked|no\s*linked\s*app"))
 
 
+def _start_gopay(serial: str, wait_s: float = 5.0) -> None:
+    _shell(serial, "am", "force-stop", "com.gojek.gopay")
+    time.sleep(1)
+    _shell(serial, "am", "start", "-n", "com.gojek.gopay/.MainActivity")
+    time.sleep(wait_s)
+
+
+def _open_linked_apps_page(serial: str, log: Callable) -> tuple[str, dict | None]:
+    """Start GoPay and navigate to the Linked apps page."""
+    _start_gopay(serial)
+    xml = _dump_ui(serial)
+
+    profile_tab = _find_by_desc(xml, re.compile(r"(?i)^profile$"))
+    if profile_tab:
+        _tap_node(serial, profile_tab, log, "Profile tab")
+        time.sleep(3)
+        xml = _dump_ui(serial)
+    else:
+        log(f"[unlink] 当前页面元素: {_dump_all_descs(xml)[:15]}")
+
+    settings_node = _find_by_desc(xml, re.compile(
+        r"(?i)account\s*&?\s*app\s*setting"
+    ))
+    if not settings_node:
+        _shell(serial, "input", "swipe", "450", "1200", "450", "400", "300")
+        time.sleep(2)
+        xml = _dump_ui(serial)
+        settings_node = _find_by_desc(xml, re.compile(
+            r"(?i)account\s*&?\s*app\s*setting"
+        ))
+
+    if not settings_node:
+        descs = _dump_all_descs(xml)
+        log(f"[unlink] 未找到 Account & app settings，当前页面元素: {descs[:15]}")
+        _back(serial)
+        return xml, {
+            "ok": False,
+            "message": f"未找到 Account & app settings 入口。页面元素: {descs[:10]}",
+        }
+
+    _tap_node(serial, settings_node, log, "Account & app settings")
+    time.sleep(2)
+    xml = _dump_ui(serial)
+
+    linked_node = _find_by_desc(xml, re.compile(r"(?i)linked\s*app"))
+    if not linked_node:
+        _shell(serial, "input", "swipe", "450", "1000", "450", "400", "300")
+        time.sleep(1)
+        xml = _dump_ui(serial)
+        linked_node = _find_by_desc(xml, re.compile(r"(?i)linked\s*app"))
+
+    if not linked_node:
+        log("[unlink] 未找到 Linked apps 入口")
+        _back(serial)
+        return xml, {"ok": False, "message": "未找到 Linked apps 入口"}
+
+    _tap_node(serial, linked_node, log, "Linked apps")
+    return xml, None
+
+
 def gopay_unlink_openai(
     serial: str = "emulator-5554",
     timeout: float = 60.0,
@@ -152,61 +212,10 @@ def gopay_unlink_openai(
     """
     log(f"[unlink] 开始 GoPay unlink OpenAI (device={serial})")
 
-    # Step 1: 强制停止再启动 GoPay，确保干净状态
-    _shell(serial, "am", "force-stop", "com.gojek.gopay")
-    time.sleep(1)
-    _shell(serial, "am", "start", "-n", "com.gojek.gopay/.MainActivity")
-    time.sleep(5)
-    xml = _dump_ui(serial)
-
-    # Step 2: 定位 Profile tab 并导航到 Account 页面
-    # GoPay 启动后默认在 Home 页面，需要先切到 Profile tab
-    profile_tab = _find_by_desc(xml, re.compile(r"(?i)^profile$"))
-    if profile_tab:
-        _tap_node(serial, profile_tab, log, "Profile tab")
-        time.sleep(3)
-        xml = _dump_ui(serial)
-    else:
-        log(f"[unlink] 当前页面元素: {_dump_all_descs(xml)[:15]}")
-
-    # Step 3: 找到并点击 "Account & app settings"
-    # content-desc 包含完整描述: "Account & app settings\nControl your app preferences..."
-    settings_node = _find_by_desc(xml, re.compile(
-        r"(?i)account\s*&?\s*app\s*setting"
-    ))
-    if not settings_node:
-        # 可能在 Profile 页面下面，先滑动
-        _shell(serial, "input", "swipe", "450", "1200", "450", "400", "300")
-        time.sleep(2)
-        xml = _dump_ui(serial)
-        settings_node = _find_by_desc(xml, re.compile(
-            r"(?i)account\s*&?\s*app\s*setting"
-        ))
-
-    if not settings_node:
-        descs = _dump_all_descs(xml)
-        log(f"[unlink] 未找到 Account & app settings，当前页面元素: {descs[:15]}")
-        _back(serial)
-        return {"ok": False, "message": f"未找到 Account & app settings 入口。页面元素: {descs[:10]}"}
-
-    _tap_node(serial, settings_node, log, "Account & app settings")
-    time.sleep(2)
-    xml = _dump_ui(serial)
-
-    # Step 4: 找到并点击 "Linked apps"
-    linked_node = _find_by_desc(xml, re.compile(r"(?i)linked\s*app"))
-    if not linked_node:
-        _shell(serial, "input", "swipe", "450", "1000", "450", "400", "300")
-        time.sleep(1)
-        xml = _dump_ui(serial)
-        linked_node = _find_by_desc(xml, re.compile(r"(?i)linked\s*app"))
-
-    if not linked_node:
-        log("[unlink] 未找到 Linked apps 入口")
-        _back(serial)
-        return {"ok": False, "message": "未找到 Linked apps 入口"}
-
-    _tap_node(serial, linked_node, log, "Linked apps")
+    # Step 1-4: 强制重启 GoPay 并导航到 Linked apps 页面，确保干净状态。
+    xml, nav_error = _open_linked_apps_page(serial, log)
+    if nav_error:
+        return nav_error
 
     # Step 5: 等待 Linked apps 页面加载完成（数据异步加载）
     openai_node = None
@@ -296,12 +305,35 @@ def gopay_unlink_openai(
             _back(serial)
             xml = _dump_ui(serial)
 
-    log("[unlink] 解绑后 OpenAI 仍在列表中，可能未成功")
+    log("[unlink] 解绑后 OpenAI 仍在列表中，重启 GoPay 后做最终复查")
+    xml, nav_error = _open_linked_apps_page(serial, log)
+    if not nav_error:
+        verify_deadline = time.time() + 12
+        while time.time() < verify_deadline:
+            xml = _dump_ui(serial)
+            if _find_no_linked_apps(xml) or not _find_openai_linked(xml):
+                _back(serial)
+                _back(serial)
+                log("[unlink] GoPay OpenAI unlink 成功（final_recheck）")
+                return {
+                    "ok": True,
+                    "message": "GoPay 已成功取消 OpenAI 关联（final_recheck）",
+                    "attempts": attempts,
+                    "final_recheck": True,
+                }
+            time.sleep(2)
+        last_descs = _dump_all_descs(xml)
+    elif nav_error:
+        last_descs = _dump_all_descs(xml)
+        log(f"[unlink] final_recheck 导航失败: {nav_error.get('message', '')}")
+
+    log("[unlink] final_recheck 后 OpenAI 仍在列表中，可能未成功")
     _back(serial)
     _back(serial)
     return {
         "ok": False,
-        "message": "执行了 Unlink 操作但 OpenAI 仍在列表中",
+        "message": "执行了 Unlink 操作但 final_recheck 后 OpenAI 仍在列表中",
         "attempts": attempts,
+        "final_recheck": True,
         "debug_descs": last_descs[:10],
     }

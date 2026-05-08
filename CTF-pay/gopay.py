@@ -82,8 +82,8 @@ GOPAY_PIN_CLIENT_ID_CHARGE = "47180a8e-f56e-11ed-a05b-0242ac120003-GWC"
 DEFAULT_TIMEOUT = 30
 LINK_RETRY_LIMIT = 2  # 406 "account already linked" retry
 LINK_RETRY_SLEEP_S = 12.0  # Midtrans 需要冷却 ~10s 才会让 406 → 201（实测）
-LINK_429_SLEEP_S = 10.0  # 429 速率限制固定冷却（优先用 Retry-After 头部）
-LINK_429_RETRY_LIMIT = 5  # 429 独立重试上限，超过后交由 pipeline 重新发起支付流程
+LINK_429_SLEEP_S = 3.0  # 429 速率限制固定冷却
+LINK_429_RETRY_LIMIT = 30  # 429 独立重试上限，超过后交由 pipeline 重新发起支付流程
 DEFAULT_OTP_REGEX = r"(?<!\d)(\d{6})(?!\d)"
 
 
@@ -605,6 +605,18 @@ class GoPayCharger:
         )
         return None
 
+    @staticmethod
+    def _midtrans_406_message(r: Any) -> str:
+        try:
+            j = r.json()
+        except Exception:
+            j = None
+        if isinstance(j, dict):
+            return str((j.get("error_messages") or ["?"])[0])
+        if isinstance(j, list) and j:
+            return str(j[0])
+        return r.text[:120]
+
     def _midtrans_init_linking(self, snap_token: str) -> str:
         """POST snap/v3/accounts/{snap}/linking. Retries on 406."""
         url = f"https://app.midtrans.com/snap/v3/accounts/{snap_token}/linking"
@@ -623,6 +635,7 @@ class GoPayCharger:
         retries_406 = 0
         retries_429 = 0
         tried_no_auth = False
+        tried_unlink_after_406 = False
         max_total = LINK_RETRY_LIMIT + LINK_429_RETRY_LIMIT + 1
         for _ in range(max_total):
             r = self.mt.post(url, json=body, headers=headers, timeout=DEFAULT_TIMEOUT)
@@ -639,12 +652,6 @@ class GoPayCharger:
                 if retries_429 > LINK_429_RETRY_LIMIT:
                     raise GoPayError(f"midtrans linking 429 exhausted {LINK_429_RETRY_LIMIT} retries")
                 wait = LINK_429_SLEEP_S
-                ra = r.headers.get("Retry-After")
-                if ra:
-                    try:
-                        wait = max(float(ra), 5.0)
-                    except (ValueError, TypeError):
-                        pass
                 self.log(f"[gopay] midtrans linking 429 rate-limited, 冷却 {wait}s 再重试 {retries_429}/{LINK_429_RETRY_LIMIT}")
                 last_err = f"429 rate-limited (waited {wait}s)"
                 time.sleep(wait)
@@ -653,16 +660,13 @@ class GoPayCharger:
                 retries_406 += 1
                 if retries_406 > LINK_RETRY_LIMIT:
                     break
-                try:
-                    j = r.json()
-                except Exception:
-                    j = None
-                if isinstance(j, dict):
-                    last_err = (j.get("error_messages") or ["?"])[0]
-                elif isinstance(j, list) and j:
-                    last_err = str(j[0])
-                else:
-                    last_err = r.text[:120]
+                last_err = self._midtrans_406_message(r)
+                if not tried_unlink_after_406:
+                    tried_unlink_after_406 = True
+                    self._try_auto_unlink(
+                        force=True,
+                        reason=f"midtrans linking 406: {last_err}",
+                    )
                 self.log(f"[gopay] midtrans linking 406 ({last_err}), 冷却 {LINK_RETRY_SLEEP_S}s 再重试 {retries_406}/{LINK_RETRY_LIMIT}")
                 time.sleep(LINK_RETRY_SLEEP_S)
                 continue
@@ -961,30 +965,41 @@ class GoPayCharger:
 
         # 支付成功后自动 unlink GoPay → OpenAI（防止下次 406 "already linked"）
         if result.get("state") == "succeeded":
-            self._try_auto_unlink()
+            self._try_auto_unlink(force=True, reason="payment_success")
 
         return result
 
-    def _try_auto_unlink(self) -> None:
-        """best-effort: 如果配置了 auto_unlink 且 OTP source 是 adb，自动 unlink。"""
+    def _try_auto_unlink(self, *, force: bool = False, reason: str = "") -> bool:
+        """Best-effort GoPay → OpenAI unlink via ADB; returns whether it verified."""
         otp_cfg = self._gopay_cfg.get("otp") or self._gopay_cfg.get("otp_provider") or {}
         if not isinstance(otp_cfg, dict):
-            return
+            return False
         otp_source = str(otp_cfg.get("source") or "").strip().lower()
         auto_unlink = self._gopay_cfg.get("auto_unlink", False)
-        if not auto_unlink or otp_source != "adb":
-            return
+        if not force and not auto_unlink:
+            return False
+        if otp_source != "adb":
+            if force:
+                self.log(f"[gopay] 跳过 unlink: OTP source={otp_source or 'unset'}，需要 adb")
+            return False
         serial = str(otp_cfg.get("adb_serial") or "emulator-5554")
+        attempts = max(1, _int_cfg(self._gopay_cfg, "auto_unlink_retries", 3))
+        retry_sleep = max(0.0, _float_cfg(self._gopay_cfg, "auto_unlink_retry_sleep_s", 3.0))
         try:
             from gopay_unlink_adb import gopay_unlink_openai
-            self.log("[gopay] 支付成功，自动 unlink GoPay → OpenAI ...")
-            result = gopay_unlink_openai(serial=serial, log=self.log)
-            if result.get("ok"):
-                self.log(f"[gopay] unlink 完成: {result.get('message', '')}")
-            else:
+            why = f" ({reason})" if reason else ""
+            for attempt in range(1, attempts + 1):
+                self.log(f"[gopay] 自动 unlink GoPay → OpenAI{why} ... ({attempt}/{attempts})")
+                result = gopay_unlink_openai(serial=serial, log=self.log)
+                if result.get("ok"):
+                    self.log(f"[gopay] unlink 完成: {result.get('message', '')}")
+                    return True
                 self.log(f"[gopay] unlink 未完全成功: {result.get('message', '')}")
+                if attempt < attempts:
+                    time.sleep(retry_sleep)
         except Exception as e:
             self.log(f"[gopay] unlink 异常（不影响支付结果）: {e}")
+        return False
 
 
 # ──────────────────────────── OTP providers ───────────────────────

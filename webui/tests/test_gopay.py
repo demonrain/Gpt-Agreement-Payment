@@ -280,6 +280,150 @@ def test_linking_429_falls_back_without_authorization(monkeypatch):
 
 
 @responses.activate
+def test_linking_429_retries_thirty_times_every_three_seconds(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(gopay.time, "sleep", sleeps.append)
+    url = f"https://app.midtrans.com/snap/v3/accounts/{SNAP_TOKEN}/linking"
+    no_auth_fallbacks = 0
+
+    def request_callback(request):
+        nonlocal no_auth_fallbacks
+        if "Authorization" not in request.headers:
+            no_auth_fallbacks += 1
+            return (
+                406,
+                {"Content-Type": "application/json"},
+                '{"error_messages":["fallback unavailable"]}',
+            )
+        return (
+            429,
+            {"Content-Type": "application/json", "Retry-After": "17"},
+            '{"error":"too many requests"}',
+        )
+
+    responses.add_callback(responses.POST, url, callback=request_callback)
+
+    charger = build_charger()
+
+    with pytest.raises(gopay.GoPayError, match="429 exhausted 30 retries"):
+        charger._midtrans_init_linking(SNAP_TOKEN)
+
+    assert no_auth_fallbacks == 1
+    assert sleeps == [3.0] * 30
+    auth_calls = [call for call in responses.calls if "Authorization" in call.request.headers]
+    no_auth_calls = [call for call in responses.calls if "Authorization" not in call.request.headers]
+    assert len(auth_calls) == 31
+    assert len(no_auth_calls) == 1
+
+
+@responses.activate
+def test_linking_406_attempts_auto_unlink_before_retry(monkeypatch):
+    monkeypatch.setattr(gopay.time, "sleep", lambda _s: None)
+    url = f"https://app.midtrans.com/snap/v3/accounts/{SNAP_TOKEN}/linking"
+    responses.post(
+        url,
+        json={"error_messages": ["account already linked"]},
+        status=406,
+    )
+    responses.post(
+        url,
+        json={
+            "status_code": "201",
+            "activation_link_url": (
+                f"https://merchants-gws-app.gopayapi.com/app/authorize?reference={LINK_REF}&target=gwc"
+            ),
+        },
+        status=201,
+    )
+    unlink_calls = []
+
+    charger = build_charger()
+    monkeypatch.setattr(
+        charger,
+        "_try_auto_unlink",
+        lambda **kwargs: unlink_calls.append(kwargs) or True,
+    )
+
+    assert charger._midtrans_init_linking(SNAP_TOKEN) == LINK_REF
+    assert len(unlink_calls) == 1
+    assert unlink_calls[0]["force"] is True
+    assert "406" in unlink_calls[0]["reason"]
+
+
+def test_auto_unlink_retries_until_verified(monkeypatch):
+    attempts = []
+    sleeps = []
+    fake_mod = type(sys)("gopay_unlink_adb")
+
+    def fake_unlink_openai(serial, log, **_kwargs):
+        attempts.append(serial)
+        if len(attempts) == 1:
+            return {"ok": False, "message": "OpenAI still visible"}
+        return {"ok": True, "message": "unlinked"}
+
+    fake_mod.gopay_unlink_openai = fake_unlink_openai
+    monkeypatch.setitem(sys.modules, "gopay_unlink_adb", fake_mod)
+    monkeypatch.setattr(gopay.time, "sleep", sleeps.append)
+
+    cs_session = requests.Session()
+    cs_session.headers["Cookie"] = "__Secure-next-auth.session-token=fake"
+    charger = gopay.GoPayCharger(
+        cs_session,
+        {
+            "country_code": "86",
+            "phone_number": "00000000000",
+            "pin": "654321",
+            "auto_unlink": True,
+            "auto_unlink_retries": 3,
+            "auto_unlink_retry_sleep_s": 0.5,
+            "otp": {"source": "adb", "adb_serial": "device-1"},
+        },
+        otp_provider=lambda: "123456",
+        log=lambda _m: None,
+    )
+
+    assert charger._try_auto_unlink(reason="payment_success") is True
+    assert attempts == ["device-1", "device-1"]
+    assert sleeps == [0.5]
+
+
+def test_payment_success_forces_adb_unlink_even_without_auto_unlink_flag(monkeypatch):
+    calls = []
+
+    cs_session = requests.Session()
+    cs_session.headers["Cookie"] = "__Secure-next-auth.session-token=fake"
+    charger = gopay.GoPayCharger(
+        cs_session,
+        {
+            "country_code": "86",
+            "phone_number": "00000000000",
+            "pin": "654321",
+            "otp": {"source": "adb", "adb_serial": "device-1"},
+        },
+        otp_provider=lambda: "123456",
+        log=lambda _m: None,
+    )
+
+    monkeypatch.setattr(charger, "_midtrans_load_transaction", lambda snap: None)
+    monkeypatch.setattr(charger, "_midtrans_init_linking", lambda snap: LINK_REF)
+    monkeypatch.setattr(charger, "_gopay_validate_reference", lambda ref: None)
+    monkeypatch.setattr(charger, "_gopay_user_consent", lambda ref: None)
+    monkeypatch.setattr(charger, "_gopay_validate_otp", lambda ref, otp: (CHALLENGE_ID, gopay.GOPAY_PIN_CLIENT_ID_LINK))
+    monkeypatch.setattr(charger, "_tokenize_pin", lambda challenge_id, client_id: PIN_JWT_LINK)
+    monkeypatch.setattr(charger, "_gopay_validate_pin", lambda ref, token: None)
+    monkeypatch.setattr(charger, "_midtrans_create_charge", lambda snap: CHARGE_REF)
+    monkeypatch.setattr(charger, "_gopay_payment_validate", lambda ref: None)
+    monkeypatch.setattr(charger, "_gopay_payment_confirm", lambda ref: (CHALLENGE_ID2, gopay.GOPAY_PIN_CLIENT_ID_CHARGE))
+    monkeypatch.setattr(charger, "_gopay_payment_process", lambda ref, token: None)
+    monkeypatch.setattr(charger, "_try_auto_unlink", lambda **kwargs: calls.append(kwargs) or True)
+
+    result = charger._run_midtrans_and_gopay(SNAP_TOKEN, cs_id="")
+
+    assert result["state"] == "succeeded"
+    assert calls == [{"force": True, "reason": "payment_success"}]
+
+
+@responses.activate
 def test_validate_otp_retryable_error_raises_rejected():
     responses.post(
         "https://gwa.gopayapi.com/v1/linking/validate-otp",
@@ -321,7 +465,7 @@ def test_run_midtrans_retries_after_retryable_otp_rejection(monkeypatch):
         lambda ref: (CHALLENGE_ID2, gopay.GOPAY_PIN_CLIENT_ID_CHARGE),
     )
     monkeypatch.setattr(charger, "_gopay_payment_process", lambda ref, token: None)
-    monkeypatch.setattr(charger, "_try_auto_unlink", lambda: None)
+    monkeypatch.setattr(charger, "_try_auto_unlink", lambda **_kwargs: None)
 
     def fake_validate_otp(reference_id, otp):
         validated.append(otp)
